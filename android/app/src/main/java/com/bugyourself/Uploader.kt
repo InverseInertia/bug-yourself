@@ -16,7 +16,7 @@ object Uploader {
             conn.connectTimeout = 10_000
             conn.readTimeout = 60_000
             conn.setFixedLengthStreamingMode(file.length())
-            conn.setRequestProperty("Content-Type", "audio/wav")
+            conn.setRequestProperty("Content-Type", if (file.name.endsWith(".flac")) "audio/flac" else "audio/wav")
             conn.setRequestProperty("X-Sha256", sha)
             if (token.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $token")
             conn.outputStream.use { os -> file.inputStream().use { it.copyTo(os, 1 shl 16) } }

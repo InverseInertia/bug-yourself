@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Receive WAV segments from the phone, store them as Ogg Vorbis, and join them back up.
+"""Receive FLAC (or WAV) segments from the phone, store them as Ogg Vorbis, and join them back up.
 
     python3 receiver.py serve [--dir recordings] [--bind 0.0.0.0] [--port 8675]
                               [--token SECRET] [--quality 10] [--max-size 10GB]
@@ -23,7 +23,7 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-NAME_RE = re.compile(r"^(?P<session>[0-9A-Za-z-]+)_(?P<seq>\d+)\.(?P<ext>wav|ogg)$")
+NAME_RE = re.compile(r"^(?P<session>[0-9A-Za-z-]+)_(?P<seq>\d+)\.(?P<ext>wav|flac|ogg)$")
 CHUNK = 1 << 16
 UNITS = {"": 1, "B": 1, "K": 1 << 10, "KB": 1 << 10, "M": 1 << 20, "MB": 1 << 20,
          "G": 1 << 30, "GB": 1 << 30, "T": 1 << 40, "TB": 1 << 40}
@@ -34,6 +34,13 @@ def parse_size(s):
     if not m or m[2].upper() not in UNITS:
         raise argparse.ArgumentTypeError(f"bad size {s!r} (try 10GB, 500MB, 0 for unlimited)")
     return int(float(m[1]) * UNITS[m[2].upper()])
+
+
+def quality(s):
+    q = float(s)
+    if not -1 <= q <= 10:
+        raise argparse.ArgumentTypeError("quality must be between -1 and 10")
+    return q
 
 
 def human(n):
@@ -54,10 +61,10 @@ def run(cmd):
 
 def encode(wav, ogg, quality):
     if shutil.which("oggenc"):
-        run(["oggenc", "-Q", "-q", str(quality), "-o", str(ogg), str(wav)])
+        run(["oggenc", "-Q", "-q", f"{quality:g}", "-o", str(ogg), str(wav)])
     else:
         run(["ffmpeg", "-v", "error", "-y", "-i", str(wav),
-             "-c:a", "libvorbis", "-q:a", str(quality), "-f", "ogg", str(ogg)])
+             "-c:a", "libvorbis", "-q:a", f"{quality:g}", "-f", "ogg", str(ogg)])
 
 
 def decode(ogg, wav):
@@ -140,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
         prefix = "/upload/"
         name = self.path[len(prefix):] if self.path.startswith(prefix) else ""
         m = NAME_RE.match(name)
-        if not m or m["ext"] != "wav":
+        if not m or m["ext"] not in ("wav", "flac"):
             return self.reply(400, "bad name")
         try:
             length = int(self.headers["Content-Length"])
@@ -150,14 +157,14 @@ class Handler(BaseHTTPRequestHandler):
 
         dest_dir = self.root / m["session"]
         dest_dir.mkdir(parents=True, exist_ok=True)
-        stem = name[:-4]
+        stem = name.rsplit(".", 1)[0]
         dest = dest_dir / (stem + ".ogg")
-        wav_part = dest_dir / (stem + ".wav.part")
-        ogg_part = dest_dir / (stem + ".ogg.part")
+        in_part = dest_dir / f"{stem}.part.{m['ext']}"  # keep the real extension for the encoder
+        ogg_part = dest_dir / (stem + ".part.ogg")
 
         h = hashlib.sha256()
         remaining = length
-        with open(wav_part, "wb") as f:
+        with open(in_part, "wb") as f:
             while remaining:
                 block = self.rfile.read(min(CHUNK, remaining))
                 if not block:
@@ -167,16 +174,16 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(block)
 
         if remaining or (expected and h.hexdigest() != expected):
-            wav_part.unlink(missing_ok=True)
+            in_part.unlink(missing_ok=True)
             return self.reply(400, "incomplete or corrupt upload")
 
         # A retry after a lost response: this chunk is already stored.
         if dest.exists():
-            wav_part.unlink()
+            in_part.unlink()
             return self.reply(200, "already have it")
 
         try:
-            encode(wav_part, ogg_part, self.quality)
+            encode(in_part, ogg_part, self.quality)
             with open(ogg_part, "rb+") as f:
                 os.fsync(f.fileno())
             os.replace(ogg_part, dest)
@@ -185,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("encode failed for %s: %s", name, e)
             return self.reply(500, "encode failed")
         finally:
-            wav_part.unlink(missing_ok=True)
+            in_part.unlink(missing_ok=True)
 
         self.log_message("saved %s (%d -> %d bytes)", dest.name, length, dest.stat().st_size)
         prune(self.root, self.max_bytes)
@@ -199,12 +206,12 @@ def serve(args):
     Handler.quality = args.quality
     Handler.max_bytes = args.max_size
     Handler.root.mkdir(parents=True, exist_ok=True)
-    for stale in Handler.root.rglob("*.part"):
+    for stale in Handler.root.rglob("*.part.*"):
         stale.unlink()
     prune(Handler.root, args.max_size)
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     limit = human(args.max_size) if args.max_size else "unlimited"
-    print(f"Saving to {Handler.root} as Ogg Vorbis q{args.quality} via {codec}, limit {limit}, "
+    print(f"Saving to {Handler.root} as Ogg Vorbis q{args.quality:g} via {codec}, limit {limit}, "
           f"listening on {args.bind}:{args.port}", flush=True)
     try:
         srv.serve_forever()
@@ -236,7 +243,7 @@ def join(args):
         with wave.open(str(joined_wav), "wb") as out:
             for seq, p in segs:
                 pcm = p
-                if p.suffix == ".ogg":
+                if p.suffix != ".wav":
                     pcm = tmp / f"{seq}.wav"
                     decode(p, pcm)
                 with wave.open(str(pcm), "rb") as w:
@@ -261,14 +268,16 @@ def main():
     s.add_argument("--bind", default="0.0.0.0", help="tip: your Tailscale IP, so only the tailnet can reach it")
     s.add_argument("--port", type=int, default=8675)
     s.add_argument("--token", help="shared secret (or set BUG_TOKEN)")
-    s.add_argument("--quality", type=float, default=10, help="Vorbis quality, -1..10 (default 10)")
+    s.add_argument("--quality", type=quality, default=quality(os.environ.get("BUG_QUALITY", 10)),
+                   help="Vorbis quality, -1..10 (default 10, or set BUG_QUALITY)")
     s.add_argument("--max-size", type=parse_size, default=parse_size("10GB"),
                    help="delete oldest chunks past this folder size (default 10GB, 0 = unlimited)")
     s.set_defaults(fn=serve)
     j = sub.add_parser("join", help="decode a session's chunks and join them into one file (.wav or .ogg)")
     j.add_argument("session_dir")
     j.add_argument("out")
-    j.add_argument("--quality", type=float, default=10, help="Vorbis quality if out is .ogg")
+    j.add_argument("--quality", type=quality, default=quality(os.environ.get("BUG_QUALITY", 10)),
+                   help="Vorbis quality if out is .ogg (default 10, or set BUG_QUALITY)")
     j.set_defaults(fn=join)
     args = ap.parse_args()
     args.fn(args)

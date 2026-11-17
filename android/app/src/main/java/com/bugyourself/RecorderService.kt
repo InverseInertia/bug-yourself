@@ -51,7 +51,8 @@ class RecorderService : Service() {
 
         fun workDir(ctx: Context) = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "recording")
         fun outbox(ctx: Context) = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "outbox")
-        fun pending(ctx: Context) = outbox(ctx).listFiles()?.count { it.name.endsWith(".wav") } ?: 0
+        fun isAudio(f: File) = f.name.endsWith(".flac") || f.name.endsWith(".wav")
+        fun pending(ctx: Context) = outbox(ctx).listFiles()?.count(::isAudio) ?: 0
     }
 
     private val queue = LinkedBlockingQueue<ByteArray>()
@@ -82,7 +83,7 @@ class RecorderService : Service() {
                     .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bugyourself:rec").apply { acquire() }
             }
 
-            SegmentWriter.recoverOrphans(workDir(this), outbox(this), CHANNELS)
+            SegmentWriter.recoverOrphans(workDir(this), outbox(this), SAMPLE_RATE, CHANNELS)
 
             val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
             val segMinutes = prefs.getString("segMinutes", "5")!!.toDoubleOrNull()?.coerceAtLeast(0.1) ?: 5.0
@@ -173,7 +174,7 @@ class RecorderService : Service() {
             val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
             val url = prefs.getString("url", "")!!
             val token = prefs.getString("token", "")!!
-            val files = outbox(this).listFiles { f -> f.name.endsWith(".wav") }?.sortedBy { it.name }.orEmpty()
+            val files = outbox(this).listFiles(::isAudio)?.sortedBy { it.name }.orEmpty()
 
             if (files.isEmpty()) {
                 synchronized(lifecycle) {
