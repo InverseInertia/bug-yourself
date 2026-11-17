@@ -98,6 +98,10 @@ When a clip is deleted, its DB row stays with `clip_path` cleared and `clip_prun
 
 At roughly 10–20 GB of clips a year, the 100 GB cap takes years to reach. The archive's 500 GB (about 7 months of recordings) runs out much sooner, so in practice clips outlive their source audio. That's why clips are always cut at full length with padding, never just referenced.
 
+The library is a holding area. Clips worth keeping are moved out by hand, to a folder outside `samples/` that the analyzer never touches, so there's no keep flag or protection inside the library. Anything left in `samples/`, including subfolders you create there, counts toward the 100 GB and can be deleted.
+
+Clips that vanish because you moved or deleted them are normal, not errors. At the start of each run the analyzer checks the clip paths it knows about, and marks missing ones `clip_removed` (distinct from `clip_pruned`, which it set itself). Their index entries stay searchable like pruned ones. Cleanup only counts and deletes files that are actually there.
+
 `receiver.py join` already accepts several folders, so a session spread over the SSD, `unanalyzed/` and the archive can still be joined.
 
 ## Data model (SQLite)
@@ -141,6 +145,5 @@ Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by a
 
 ## Open questions
 
-- **Protected clips:** should clips marked `keep` with the feedback command (see Tuning) be exempt from the 100 GB pruning? This could be stored as a flag in the DB, or done by moving them to a separate `samples/kept/` folder outside the cap.
 - **Speaker labels** (pyannote): add later if transcripts are used a lot. They need a Hugging Face token and about 1 GB more VRAM.
 - **Tuning:** scoring needs listening sessions on real recordings. Plan a feedback command (`keep`/`reject` on clips) and use those labels to tune thresholds.
