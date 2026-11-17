@@ -3,11 +3,16 @@
 
     python3 receiver.py serve [--dir recordings] [--bind 0.0.0.0] [--port 8675]
                               [--token SECRET] [--quality 10] [--max-size 10GB]
-    python3 receiver.py join recordings/<session> out.wav
+                              [--when-full reject|prune]
+    python3 receiver.py join recordings/<session> [archive/<session> ...] out.wav
 
 Needs `oggenc`/`oggdec` (vorbis-tools) or `ffmpeg` built with libvorbis.
-Chunks land in <dir>/<session>/<session>_<seq>.ogg. When the folder grows past
---max-size, the oldest chunks are deleted first.
+Chunks land in <dir>/<session>/<session>_<seq>.ogg. <dir> is a working folder:
+the analyzer moves chunks out of it to the long-term archive every night.
+
+When the folder reaches --max-size, the default (--when-full reject) is to refuse
+new uploads with 507; the phone keeps its files and retries, so nothing is lost
+while the analyzer catches up. --when-full prune deletes the oldest chunks instead.
 """
 import argparse
 import hashlib
@@ -89,6 +94,10 @@ def check_codec():
 prune_lock = threading.Lock()
 
 
+def folder_size(root):
+    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+
+
 def prune(root, max_bytes):
     """Delete the oldest chunks until the folder is under max_bytes. Names sort by time."""
     if max_bytes <= 0:
@@ -123,6 +132,7 @@ class Handler(BaseHTTPRequestHandler):
     token: str = ""
     quality: float = 10
     max_bytes: int = 0
+    when_full: str = "reject"
 
     def reply(self, code, msg=""):
         body = (msg + "\n").encode()
@@ -154,6 +164,11 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return self.reply(411, "length required")
         expected = (self.headers.get("X-Sha256") or "").lower()
+
+        if self.when_full == "reject" and self.max_bytes > 0:
+            if folder_size(self.root) + length > self.max_bytes:
+                self.log_message("working folder full, refusing %s", name)
+                return self.reply(507, "working folder full")
 
         dest_dir = self.root / m["session"]
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -195,7 +210,8 @@ class Handler(BaseHTTPRequestHandler):
             in_part.unlink(missing_ok=True)
 
         self.log_message("saved %s (%d -> %d bytes)", dest.name, length, dest.stat().st_size)
-        prune(self.root, self.max_bytes)
+        if self.when_full == "prune":
+            prune(self.root, self.max_bytes)
         return self.reply(201, "saved")
 
 
@@ -205,12 +221,14 @@ def serve(args):
     Handler.token = args.token or os.environ.get("BUG_TOKEN", "")
     Handler.quality = args.quality
     Handler.max_bytes = args.max_size
+    Handler.when_full = args.when_full
     Handler.root.mkdir(parents=True, exist_ok=True)
     for stale in Handler.root.rglob("*.part.*"):
         stale.unlink()
-    prune(Handler.root, args.max_size)
+    if args.when_full == "prune":
+        prune(Handler.root, args.max_size)
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
-    limit = human(args.max_size) if args.max_size else "unlimited"
+    limit = f"{human(args.max_size)} ({args.when_full} when full)" if args.max_size else "unlimited"
     print(f"Saving to {Handler.root} as Ogg Vorbis q{args.quality:g} via {codec}, limit {limit}, "
           f"listening on {args.bind}:{args.port}", flush=True)
     try:
@@ -223,10 +241,15 @@ def serve(args):
 
 def join(args):
     check_codec()
-    src = Path(args.session_dir)
-    segs = sorted((int(m["seq"]), p) for p in src.iterdir() if (m := NAME_RE.match(p.name)))
+    # A session can be split between the working folder and the archive mid-migration.
+    found = {}
+    for src in map(Path, args.session_dirs):
+        for p in src.iterdir():
+            if (m := NAME_RE.match(p.name)):
+                found.setdefault(int(m["seq"]), p)
+    segs = sorted(found.items())
     if not segs:
-        sys.exit(f"no segments in {src}")
+        sys.exit(f"no segments in {', '.join(args.session_dirs)}")
 
     missing = sorted(set(range(segs[0][0], segs[-1][0] + 1)) - {s for s, _ in segs})
     if missing:
@@ -271,10 +294,12 @@ def main():
     s.add_argument("--quality", type=quality, default=quality(os.environ.get("BUG_QUALITY", 10)),
                    help="Vorbis quality, -1..10 (default 10, or set BUG_QUALITY)")
     s.add_argument("--max-size", type=parse_size, default=parse_size("10GB"),
-                   help="delete oldest chunks past this folder size (default 10GB, 0 = unlimited)")
+                   help="working folder size limit (default 10GB, 0 = unlimited)")
+    s.add_argument("--when-full", choices=["reject", "prune"], default="reject",
+                   help="at the limit: refuse uploads so the phone holds them (default), or delete oldest chunks")
     s.set_defaults(fn=serve)
     j = sub.add_parser("join", help="decode a session's chunks and join them into one file (.wav or .ogg)")
-    j.add_argument("session_dir")
+    j.add_argument("session_dirs", nargs="+", metavar="session_dir")
     j.add_argument("out")
     j.add_argument("--quality", type=quality, default=quality(os.environ.get("BUG_QUALITY", 10)),
                    help="Vorbis quality if out is .ogg (default 10, or set BUG_QUALITY)")

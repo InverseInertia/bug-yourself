@@ -17,9 +17,9 @@ python3 server/receiver.py serve --bind <your-pc-tailscale-ip> --token <pick-a-s
 The default port is 8675. Chunks land in `recordings/<session>/<session>_<seq>.ogg` (session = UTC start time).
 
 - `--quality` sets the Vorbis quality, -1 to 10 (default 10, about 250 kbps on dense material). You can also set it with the `BUG_QUALITY` environment variable. It applies to chunks that arrive after you change it.
-- `--max-size` sets the cap for the whole folder (default `10GB`, `0` for no limit). Once the folder goes over it, the oldest chunks are deleted first, across all sessions.
+- `--max-size` caps the working folder (default `10GB`, `0` for no limit). When it's full, the receiver refuses uploads with 507 and the phone keeps its files and retries, so nothing is lost. `--when-full prune` deletes the oldest chunks instead. The working folder is meant to live on the SSD; the analyzer moves each night's audio to the HDD archive (see [docs/analyzer-plan.md](docs/analyzer-plan.md)).
 
-To stitch a session into one file:
+To stitch a session into one file (list both folders if part of it has already moved to the archive):
 
 ```bash
 python3 server/receiver.py join recordings/20261117-193000 session.wav

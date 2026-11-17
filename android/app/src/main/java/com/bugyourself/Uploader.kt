@@ -5,9 +5,9 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 
-/** PUTs one file to `<baseUrl>/upload/<name>` and returns true once the server has verified it. */
+/** PUTs one file to `<baseUrl>/upload/<name>` and returns the HTTP status (2xx = stored and verified). */
 object Uploader {
-    fun upload(file: File, baseUrl: String, token: String): Boolean {
+    fun upload(file: File, baseUrl: String, token: String): Int {
         val sha = sha256Hex(file)
         val conn = URL(baseUrl.trimEnd('/') + "/upload/" + file.name).openConnection() as HttpURLConnection
         try {
@@ -20,7 +20,7 @@ object Uploader {
             conn.setRequestProperty("X-Sha256", sha)
             if (token.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $token")
             conn.outputStream.use { os -> file.inputStream().use { it.copyTo(os, 1 shl 16) } }
-            return conn.responseCode in 200..299
+            return conn.responseCode
         } finally {
             conn.disconnect()
         }

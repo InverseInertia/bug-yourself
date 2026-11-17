@@ -193,7 +193,12 @@ class RecorderService : Service() {
                 val err = when {
                     url.isBlank() -> "No server URL set"
                     else -> try {
-                        if (Uploader.upload(f, url, token)) null else "Server rejected ${f.name}"
+                        when (val code = Uploader.upload(f, url, token)) {
+                            in 200..299 -> null
+                            507 -> "PC working folder full, holding files on phone"
+                            401 -> "Wrong token"
+                            else -> "Server rejected ${f.name} ($code)"
+                        }
                     } catch (e: Exception) {
                         "Upload failed: ${e.message}"
                     }
