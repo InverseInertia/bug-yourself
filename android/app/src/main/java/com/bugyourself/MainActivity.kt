@@ -12,9 +12,11 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
+import android.view.WindowInsets
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 /** One screen: server URL, token, segment length, Start/Stop, status. No layouts, no AndroidX. */
@@ -43,14 +45,34 @@ class MainActivity : Activity() {
             text = "Disable battery optimization"
             setOnClickListener { requestBatteryExemption() }
         }
-        statusView = TextView(this).apply { setPadding(0, 32, 0, 0) }
+        statusView = TextView(this).apply { setPadding(0, dp(12), 0, 0) }
+        val title = TextView(this).apply {
+            text = "Bug Yourself"
+            textSize = 22f
+            setPadding(0, 0, 0, dp(12))
+        }
 
-        setContentView(LinearLayout(this).apply {
+        val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 96, 48, 48)
-            listOf(url, token, seg, toggle, battery, statusView).forEach(::addView)
-        })
+            listOf(title, url, token, seg, toggle, battery, statusView).forEach(::addView)
+        }
+        // Android 15+ draws apps edge-to-edge: pad by the real status/nav bar (and keyboard)
+        // size plus a small gap, so nothing sits under the system bars.
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            val (l, t, r, b) = if (Build.VERSION.SDK_INT >= 30) {
+                val i = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
+                listOf(i.left, i.top, i.right, i.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                listOf(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            }
+            v.setPadding(l + dp(16), t + dp(16), r + dp(16), b + dp(16))
+            insets
+        }
+        setContentView(ScrollView(this).apply { addView(root) })
     }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     override fun onResume() {
         super.onResume()
