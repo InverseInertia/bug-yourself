@@ -11,7 +11,8 @@ The analyzer runs once a night. It finds points of interest for sampling in reco
 | `recordings/` (working) | SSD | receiver writes; receiver moves out at 00:05 | ~1 day; 10 GB hard cap, receiver refuses uploads when full (phone holds them) |
 | `unanalyzed/<session>/` | HDD | receiver moves chunks in at 00:05; analyzer archives them out | grows only while the analyzer is down (~2.4 GB/day) |
 | `archive/<session>/` | HDD | analyzer | 500 GB; oldest chunks deleted first |
-| `samples/` | HDD | analyzer | never pruned automatically |
+| `samples-new/` | SSD | analyzer writes tonight's clips | about one night of clips; moved to the HDD at the start of the next run |
+| `samples/` | HDD | analyzer | 100 GB; oldest clips deleted first |
 | `analyzer.db` (SQLite) | HDD, next to archive | analyzer | small (MBs per day) |
 | model cache, venv | SSD | analyzer | ~5 GB once |
 
@@ -44,7 +45,7 @@ Each chunk is decoded once (Ogg → 48 kHz mono float) and then passes through t
 - **Tag (GPU, PANNs or BEATs).** Candidate windows get AudioSet labels with confidences. The top label becomes part of the clip name.
 - **Embed (GPU, CLAP).** Every candidate gets a 512-dim embedding, plus one embedding per 10 s window of the whole day for open-ended search. Stored as blobs and searched by brute force in numpy; 100k vectors take milliseconds.
 - **Transcribe (GPU, faster-whisper large-v3-turbo, 8-bit).** Runs on the speech regions, with word timestamps. Segments whose confidence suggests invented text (high no-speech probability, very low average log-probability) are dropped.
-- **Clip.** Each kept candidate is cut with 50 ms of padding and short fades, and written to `samples/<kind>/<label>_<yyyymmdd>_<id>.flac`. FLAC avoids a second round of lossy encoding. The label comes from the tagger, e.g. `glass_20261117_a3f9.flac`; `untagged_…` is used when the tagger isn't confident.
+- **Clip.** Each kept candidate is cut with 50 ms of padding and short fades, and written to `samples-new/<kind>/<label>_<yyyymmdd>_<id>.flac` on the SSD. FLAC avoids a second round of lossy encoding. The label comes from the tagger, e.g. `glass_20261117_a3f9.flac`; `untagged_…` is used when the tagger isn't confident.
 
 **Chunk boundaries.** Each chunk is analyzed with the last 10 s of the previous chunk prepended, read from wherever that chunk now is (SSD, `unanalyzed/` or archive). Events that start inside that context are owned by the previous chunk, so nothing is counted twice. Speech that runs across a boundary gets transcribed whole.
 
@@ -82,7 +83,20 @@ The analyzer (00:00) and the receiver's move (00:05) can overlap on a long night
 
 If a chunk fails analysis three nights running, it's archived anyway and marked `analysis_failed`, so one bad file never sits in `unanalyzed/` forever. `analyzer.py reanalyze` can retry it from the archive later.
 
-After migration, the archive is pruned to 500 GB (the receiver's `prune()` logic, reused). Pruning touches only archive chunks; `samples/` and the DB are never deleted. DB rows for pruned audio stay, marked `audio_pruned`, so transcripts and tags remain searchable even after the source audio is gone, and the clips in `samples/` survive.
+After migration, the archive is pruned to 500 GB (the receiver's `prune()` logic, reused). Pruning touches only archive chunks, never clips or the DB. DB rows for pruned audio stay, marked `audio_pruned`, so transcripts and tags remain searchable even after the source audio is gone.
+
+## Samples library
+
+Clips follow the same SSD-then-HDD pattern as the recordings:
+- **New clips** from tonight's run land in `samples-new/` on the SSD, so the most recent finds open quickly the next day.
+- **Moving to the HDD** happens at the start of the next run: everything in `samples-new/` moves to `samples/<kind>/`, with the same verify-then-delete as the chunk moves. A clip still being reviewed is just read from its new location; the DB tracks each clip's current path.
+- **The 100 GB cap** is enforced after that move, deleting the oldest clips first until the folder fits.
+
+"Oldest" means when the clip was cut, not when the audio was recorded. Otherwise a clip you deliberately re-cut today from months-old audio (`cut`, `reanalyze`) would be the first thing deleted. In nightly operation the two orders are nearly identical anyway. The cut time comes from the DB, not file timestamps, which copying can change.
+
+When a clip is deleted, its DB row stays with `clip_path` cleared and `clip_pruned` set. The tags, embedding and transcript remain searchable. If the source audio is still in the archive, `cut <event-id>` makes the clip again.
+
+At roughly 10–20 GB of clips a year, the 100 GB cap takes years to reach. The archive's 500 GB (about 7 months of recordings) runs out much sooner, so in practice clips outlive their source audio. That's why clips are always cut at full length with padding, never just referenced.
 
 `receiver.py join` already accepts several folders, so a session spread over the SSD, `unanalyzed/` and the archive can still be joined.
 
@@ -117,7 +131,7 @@ Each milestone is useful on its own:
 
 | Milestone | Delivers | Needs GPU |
 |---|---|---|
-| A | nightly timer, migration to HDD, archive pruning, chunk state DB | no |
+| A | nightly timer, migration to HDD, archive and samples pruning, chunk state DB | no |
 | B | tonal / percussive / loop / texture detection, clip cutting, `list` | no |
 | C | AudioSet tags in clip names, CLAP `search` | yes |
 | D | VAD + Whisper transcripts, `find-text` | yes |
@@ -127,6 +141,6 @@ Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by a
 
 ## Open questions
 
-- **Samples cap:** should `samples/` have a size cap or a "keep top N per week" rule, or grow forever? At a few MB per clip and maybe a hundred clips a day, it grows by roughly 10–20 GB a year.
+- **Protected clips:** should clips marked `keep` with the feedback command (see Tuning) be exempt from the 100 GB pruning? This could be stored as a flag in the DB, or done by moving them to a separate `samples/kept/` folder outside the cap.
 - **Speaker labels** (pyannote): add later if transcripts are used a lot. They need a Hugging Face token and about 1 GB more VRAM.
 - **Tuning:** scoring needs listening sessions on real recordings. Plan a feedback command (`keep`/`reject` on clips) and use those labels to tune thresholds.
