@@ -3,7 +3,8 @@
 
     python3 receiver.py serve [--dir recordings] [--bind 0.0.0.0] [--port 8675]
                               [--token SECRET] [--quality 10] [--max-size 10GB]
-                              [--when-full reject|prune]
+                              [--when-full reject|prune] [--backup-dir HDD/unanalyzed]
+                              [--backup-at 00:05]
     python3 receiver.py join recordings/<session> [archive/<session> ...] out.wav
 
 Needs `oggenc`/`oggdec` (vorbis-tools) or `ffmpeg` built with libvorbis.
@@ -13,6 +14,10 @@ the analyzer moves chunks out of it to the long-term archive every night.
 When the folder reaches --max-size, the default (--when-full reject) is to refuse
 new uploads with 507; the phone keeps its files and retries, so nothing is lost
 while the analyzer catches up. --when-full prune deletes the oldest chunks instead.
+
+With --backup-dir, every finished chunk is also copied there once a day (default
+00:05 local time, and once at startup). The folder must already exist, so an
+unmounted drive is skipped rather than silently filled on the wrong disk.
 """
 import argparse
 import hashlib
@@ -24,14 +29,24 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timedelta
 from pathlib import Path
 
 NAME_RE = re.compile(r"^(?P<session>[0-9A-Za-z-]+)_(?P<seq>\d+)\.(?P<ext>wav|flac|ogg)$")
 CHUNK = 1 << 16
 UNITS = {"": 1, "B": 1, "K": 1 << 10, "KB": 1 << 10, "M": 1 << 20, "MB": 1 << 20,
          "G": 1 << 30, "GB": 1 << 30, "T": 1 << 40, "TB": 1 << 40}
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(CHUNK), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def parse_size(s):
@@ -46,6 +61,12 @@ def quality(s):
     if not -1 <= q <= 10:
         raise argparse.ArgumentTypeError("quality must be between -1 and 10")
     return q
+
+
+def hhmm(s):
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", s):
+        raise argparse.ArgumentTypeError("use HH:MM, e.g. 00:05")
+    return s
 
 
 def human(n):
@@ -123,6 +144,53 @@ def prune(root, max_bytes):
                 p.parent.rmdir()  # only succeeds once the session folder is empty
             except OSError:
                 pass
+
+
+# --- nightly backup ---------------------------------------------------------
+
+def backup(root, dest):
+    """Copy every finished chunk not yet in dest. Chunks never change, so name + size = done."""
+    if not dest.is_dir():
+        print(f"backup skipped: {dest} does not exist (drive not mounted?)", flush=True)
+        return
+    copied = 0
+    for src in sorted(root.rglob("*.ogg")):
+        if not NAME_RE.match(src.name):
+            continue  # skips *.part.ogg
+        target = dest / src.parent.name / src.name
+        try:
+            size = src.stat().st_size
+            if target.exists() and target.stat().st_size == size:
+                continue
+            target.parent.mkdir(exist_ok=True)
+            part = target.with_name(target.stem + ".part.ogg")
+            shutil.copyfile(src, part)
+            with open(part, "rb+") as f:
+                os.fsync(f.fileno())
+            if file_sha256(part) != file_sha256(src):
+                part.unlink()
+                raise OSError("copy does not match source")
+            os.replace(part, target)
+            copied += 1
+        except FileNotFoundError:
+            continue  # the analyzer moved it to the archive while we were copying
+        except OSError as e:
+            print(f"backup of {src.name} failed: {e}", flush=True)
+    print(f"backup: copied {copied} new chunk(s) to {dest}", flush=True)
+
+
+def next_run(at, now):
+    h, m = map(int, at.split(":"))
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return t if t > now else t + timedelta(days=1)
+
+
+def backup_loop(root, dest, at):
+    backup(root, dest)  # catch up after downtime
+    while True:
+        wait = (next_run(at, datetime.now()) - datetime.now()).total_seconds()
+        time.sleep(max(wait, 1))
+        backup(root, dest)
 
 
 # --- HTTP -------------------------------------------------------------------
@@ -227,6 +295,9 @@ def serve(args):
         stale.unlink()
     if args.when_full == "prune":
         prune(Handler.root, args.max_size)
+    if args.backup_dir:
+        threading.Thread(target=backup_loop, daemon=True,
+                         args=(Handler.root, Path(args.backup_dir).resolve(), args.backup_at)).start()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     limit = f"{human(args.max_size)} ({args.when_full} when full)" if args.max_size else "unlimited"
     print(f"Saving to {Handler.root} as Ogg Vorbis q{args.quality:g} via {codec}, limit {limit}, "
@@ -295,6 +366,8 @@ def main():
                    help="Vorbis quality, -1..10 (default 10, or set BUG_QUALITY)")
     s.add_argument("--max-size", type=parse_size, default=parse_size("10GB"),
                    help="working folder size limit (default 10GB, 0 = unlimited)")
+    s.add_argument("--backup-dir", help="copy chunks here daily, e.g. an 'unanalyzed' folder on the HDD (must exist)")
+    s.add_argument("--backup-at", type=hhmm, default="00:05", help="local time for the daily backup (default 00:05)")
     s.add_argument("--when-full", choices=["reject", "prune"], default="reject",
                    help="at the limit: refuse uploads so the phone holds them (default), or delete oldest chunks")
     s.set_defaults(fn=serve)

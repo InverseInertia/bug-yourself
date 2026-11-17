@@ -9,12 +9,15 @@ The analyzer runs once a night. It finds points of interest for sampling in the 
 | Folder | Drive | Owner | Size policy |
 |---|---|---|---|
 | `recordings/` (working) | SSD | receiver writes, analyzer empties | 10 GB; receiver refuses uploads when full (phone holds them) |
+| `unanalyzed/<session>/` | HDD | receiver copies in at 00:05, analyzer clears | holds only chunks not yet archived (normally ~1 day) |
 | `archive/<session>/` | HDD | analyzer | 500 GB; oldest chunks deleted first |
 | `samples/` | HDD | analyzer | never pruned automatically |
 | `analyzer.db` (SQLite) | HDD, next to archive | analyzer | small (MBs per day) |
 | model cache, venv | SSD | analyzer | ~5 GB once |
 
 The SSD folder normally holds less than a day (~2.4 GB at ~100 MB/hour). The 10 GB cap only matters if the analyzer stops running. Then the receiver refuses uploads with 507 and the phone keeps buffering, so a broken analyzer costs nothing until the phone fills up. The receiver no longer deletes anything by default; deletion only happens in the archive.
+
+The receiver also copies every finished chunk to `unanalyzed/` on the HDD each night at 00:05, and once at startup to catch up after downtime. Until a chunk is archived, it exists on both drives, so an SSD failure or a broken analyzer loses nothing that's more than a day old. The receiver only copies into `unanalyzed/` if that folder already exists, so an unmounted HDD is skipped rather than filled onto the SSD.
 
 The HDD root holds a marker file (`.bug-yourself-archive`). The analyzer refuses to run if it's missing. That stops it from "archiving" onto the SSD when the HDD isn't mounted.
 
@@ -73,7 +76,9 @@ For each analyzed chunk, the analyzer:
 - verifies the copy's size and SHA-256 against the source
 - renames it into place, then deletes the SSD copy
 
-If the destination already exists with the same hash, the SSD copy is just deleted, which covers a crash mid-migration. Chunk state lives in the DB (`analyzed`, `migrated`), so a crash at any point resumes cleanly.
+If the destination already exists with the same hash, the SSD copy is just deleted, which covers a crash mid-migration. Once a chunk is archived, its copy in `unanalyzed/` is deleted too.
+
+The analyzer (00:00) and the receiver's backup (00:05) overlap on a long night, and both sides tolerate it. The backup skips a chunk that disappears mid-copy. A backup that lands after the analyzer already archived that chunk leaves a stray copy, which the next run deletes: any `unanalyzed/` file whose chunk the DB marks `migrated` gets removed. If an SSD chunk is missing or fails to decode, the analyzer uses the `unanalyzed/` copy instead. Chunk state lives in the DB (`analyzed`, `migrated`), so a crash at any point resumes cleanly.
 
 If a chunk fails analysis three nights running, it's migrated anyway and marked `analysis_failed`. This keeps one bad file from clogging the SSD. `analyzer.py reanalyze` can retry it from the archive later.
 
