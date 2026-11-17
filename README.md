@@ -2,31 +2,38 @@
 
 A tiny Android app that records the mic continuously and ships the audio to a PC over Tailscale.
 
-The phone records into fixed-length WAV segments (48 kHz, 16-bit, mono) and uploads each one when it's finished. If the PC is unreachable, segments pile up on the phone and upload later. Recording never stops.
+The phone records into fixed-length WAV segments (48 kHz, 16-bit, mono) and uploads each one when it's finished. The PC encodes each segment to Ogg Vorbis at quality 10 (well above transparency, leaving headroom for sample editing) and keeps the folder under a size cap. If the PC is unreachable, segments pile up on the phone and upload later. Recording never stops.
 
 **Seamless by design.** One `AudioRecord` stream runs for the whole session and is never restarted. It gets split into segments at exact sample counts, so joining a session's segments gives back the original stream with no gaps and no clicks. Reading the mic and writing to disk happen on separate threads, so slow storage can't cause dropouts. The app uses the `UNPROCESSED` mic source (no AGC or noise suppression) when the phone supports it.
 
 ## PC side
 
-You need Python 3 and nothing else.
+You need Python 3, plus either `vorbis-tools` (`oggenc`/`oggdec`) or `ffmpeg` built with libvorbis on your PATH.
 
 ```bash
 python3 server/receiver.py serve --bind <your-pc-tailscale-ip> --token <pick-a-secret>
 ```
 
-Files land in `recordings/<session>/<session>_<seq>.wav` (session = UTC start time). To stitch a session into one file:
+The default port is 8675. Chunks land in `recordings/<session>/<session>_<seq>.ogg` (session = UTC start time).
+
+- `--quality` sets the Vorbis quality, -1 to 10 (default 10, about 250 kbps for mono speech or music).
+- `--max-size` sets the cap for the whole folder (default `10GB`, `0` for no limit). Once the folder goes over it, the oldest chunks are deleted first, across all sessions.
+
+To stitch a session into one file:
 
 ```bash
 python3 server/receiver.py join recordings/20261117-193000 session.wav
 ```
 
-Uploads carry a SHA-256 and are written to `.part` first, then renamed into place, so a half-received file is never mistaken for a finished one. Retries are idempotent.
+`join` decodes every chunk and joins them at the sample level. The output has the exact original sample count, and quality at the joins matches the rest of the audio. Name the output `.ogg` instead of `.wav` to re-encode it, at the cost of one more round of lossy encoding.
+
+Uploads carry a SHA-256 and are verified before encoding. The `.ogg` is written to a `.part` file first and renamed into place, and the phone only deletes its copy after that. Retries are idempotent.
 
 ## Phone side
 
 Get the APK from the **Build APK** GitHub Actions run (artifact `bug-yourself-apk`) and sideload it. In the app:
 
-- **Server URL**: `http://<pc-tailscale-name-or-ip>:8765`
+- **Server URL**: `http://<pc-tailscale-name-or-ip>:8675`
 - **Token**: same secret as the server
 - **Segment minutes**: default 5 (≈29 MB per segment)
 
@@ -38,4 +45,4 @@ Pending audio lives in `Android/data/com.bugyourself/files/outbox/` and survives
 
 - The APK is signed with `android/app/debug.keystore`, which is committed on purpose so every CI build installs over the last one. Uninstalling the app would delete any audio that hasn't uploaded yet.
 - Android cuts off mic input during phone calls and when another app takes the mic.
-- Storage use is ~330 MB per hour on the phone until uploaded.
+- The phone uploads lossless WAV (~330 MB per hour) and the PC does the Vorbis encoding, because Android has no built-in Vorbis encoder. On the PC, q10 works out to roughly 100 MB per hour, so the 10 GB default holds about 4 days of continuous audio.

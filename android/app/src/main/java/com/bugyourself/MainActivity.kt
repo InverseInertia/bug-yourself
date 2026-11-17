@@ -35,7 +35,7 @@ class MainActivity : Activity() {
             setText(value)
             inputType = type
         }
-        url = field("Server URL, e.g. http://my-pc:8765", prefs.getString("url", "")!!, InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_CLASS_TEXT)
+        url = field("Server URL, e.g. http://my-pc:8675", prefs.getString("url", "")!!, InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_CLASS_TEXT)
         token = field("Token (optional)", prefs.getString("token", "")!!)
         seg = field("Segment minutes", prefs.getString("segMinutes", "5")!!, InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL)
         toggle = Button(this).apply { setOnClickListener { onToggle() } }
