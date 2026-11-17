@@ -48,3 +48,37 @@ Pending audio lives in `Android/data/com.bugyourself/files/outbox/` and survives
 - The APK is signed with `android/app/debug.keystore`, which is committed on purpose so every CI build installs over the last one. Uninstalling the app would delete any audio that hasn't uploaded yet.
 - Android cuts off mic input during phone calls and when another app takes the mic.
 - The phone uploads lossless FLAC (typically 50-70% of WAV's ~330 MB per hour, depending on how noisy the room is) and the PC does the Vorbis encoding, because Android has no built-in Vorbis encoder. On the PC, q10 works out to roughly 100 MB per hour, so the 10 GB default holds about 4 days of continuous audio.
+
+## Nightly analyzer
+
+`server/analyzer.py` runs every night at midnight. It archives the day's chunks from the SSD working folder and the HDD `unanalyzed/` folder into `archive/`, keeps the archive under 500 GB and the samples library under 100 GB (deleting the oldest first), and moves the previous night's clips from the SSD into the library. Detection, tagging and transcription plug into the same run later; see [docs/analyzer-plan.md](docs/analyzer-plan.md).
+
+It needs only Python 3.11+, so it runs directly on Bazzite. Configuration lives in `~/.config/bug-yourself/analyzer.toml` (template: `server/analyzer.example.toml`). The HDD folder must contain an empty `.bug-yourself-archive` marker file, or the analyzer refuses to run, so an unmounted drive is never treated as empty.
+
+```bash
+python3 server/analyzer.py run --dry-run
+```
+
+`--dry-run` prints what would be archived, moved and deleted without changing anything. `status` shows chunk states, recent errors and folder sizes.
+
+A chunk whose analysis fails is retried on the next two nights, then archived anyway and marked failed.
+
+### Running both as services
+
+`server/systemd/` has user units for the receiver (always on, retries until Tailscale is up) and the analyzer (a midnight timer that catches up after the PC was off). They assume the repo is cloned to `~/bug-yourself`; fill in the `<...>` values in `bug-receiver.service`, put `BUG_TOKEN=<secret>` in `~/.config/bug-yourself/receiver.env`, and copy the three files to `~/.config/systemd/user/`.
+
+```bash
+systemctl --user daemon-reload
+```
+
+```bash
+systemctl --user enable --now bug-receiver.service bug-analyzer.timer
+```
+
+```bash
+loginctl enable-linger $USER
+```
+
+The last command lets them run after boot without anyone logging in. Logs: `journalctl --user -u bug-receiver -u bug-analyzer`.
+
+The receiver needs `ffmpeg` with libvorbis (or `oggenc`) on the host. If Bazzite's host doesn't have it, point `ExecStart` at `distrobox enter <box> -- python3 ...` instead.

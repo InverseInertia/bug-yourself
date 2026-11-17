@@ -1,0 +1,17 @@
+# Copy to ~/.config/bug-yourself/analyzer.toml and adjust the paths.
+
+# SSD folder the receiver writes into (receiver --dir).
+working_dir = "~/bug-yourself/recordings"
+
+# HDD folder holding everything long-term. The analyzer refuses to run unless
+# it contains a file named .bug-yourself-archive (create it once with touch),
+# so an unmounted drive is never mistaken for an empty one.
+# Inside it: unanalyzed/ (receiver --unanalyzed-dir), archive/, samples/, analyzer.db
+hdd_root = "/run/media/system/<label>/bug-yourself"
+
+# SSD folder for each night's new clips; moved into <hdd_root>/samples the next night.
+samples_new_dir = "~/bug-yourself/samples-new"
+
+# Oldest chunks / clips are deleted once these are exceeded.
+archive_max = "500GB"
+samples_max = "100GB"

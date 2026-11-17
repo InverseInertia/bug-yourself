@@ -166,6 +166,53 @@ def move_lock(root):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+class Conflict(Exception):
+    """The destination already holds a different file with the same name."""
+
+
+def move_verified(src, dst):
+    """Move src to dst so that a crash at any point leaves at least one intact copy.
+
+    Same filesystem: atomic rename. Across drives: copy to a .part file, fsync, compare
+    SHA-256, rename into place, then delete src. If dst already exists (an earlier move
+    was interrupted) and is identical, src is just deleted.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        if file_sha256(dst) != file_sha256(src):
+            raise Conflict(f"{dst} exists with different content")
+        src.unlink()
+        return
+    if src.stat().st_dev == dst.parent.stat().st_dev:
+        os.replace(src, dst)
+        return
+    digest = file_sha256(src)
+    part = dst.with_name(dst.stem + ".part" + dst.suffix)
+    shutil.copyfile(src, part)
+    with open(part, "rb+") as f:
+        os.fsync(f.fileno())
+    if file_sha256(part) != digest:
+        part.unlink()
+        raise OSError("copy does not match source")
+    os.replace(part, dst)
+    src.unlink()
+
+
+def remove_empty_dirs(root, keep_newest=False):
+    """Remove empty session folders. keep_newest spares the folder the phone may still be filling."""
+    dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    for d in dirs[:-1] if keep_newest else dirs:
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+
+
+def chunk_files(root):
+    """Finished chunks under root (never *.part.*), oldest first."""
+    return sorted((p for p in root.rglob("*.ogg") if NAME_RE.match(p.name)), key=lambda p: p.name)
+
+
 def offload(root, dest):
     """Move every finished chunk to dest (the HDD 'unanalyzed' folder) so the SSD stays small."""
     if not dest.is_dir():
@@ -173,38 +220,17 @@ def offload(root, dest):
         return
     moved = 0
     with move_lock(root):
-        for src in sorted(root.rglob("*.ogg")):
-            if not NAME_RE.match(src.name):
-                continue  # skips *.part.ogg
-            target = dest / src.parent.name / src.name
+        for src in chunk_files(root):
             try:
-                digest = file_sha256(src)
-                if target.exists():
-                    # Already copied by an interrupted earlier run: drop the SSD copy if identical.
-                    if file_sha256(target) != digest:
-                        print(f"offload: {target} exists with different content, leaving {src.name}", flush=True)
-                        continue
-                else:
-                    target.parent.mkdir(exist_ok=True)
-                    part = target.with_name(target.stem + ".part.ogg")
-                    shutil.copyfile(src, part)
-                    with open(part, "rb+") as f:
-                        os.fsync(f.fileno())
-                    if file_sha256(part) != digest:
-                        part.unlink()
-                        raise OSError("copy does not match source")
-                    os.replace(part, target)
-                src.unlink()
+                move_verified(src, dest / src.parent.name / src.name)
                 moved += 1
-            except OSError as e:
+            except FileNotFoundError:
+                continue  # the analyzer archived it first
+            except (OSError, Conflict) as e:
                 print(f"offload of {src.name} failed: {e}", flush=True)
-        # Remove emptied session folders, except the newest: the phone is still uploading
-        # into it. (Any other collision just fails one upload, which the phone retries.)
-        for d in sorted(d for d in root.iterdir() if d.is_dir())[:-1]:
-            try:
-                d.rmdir()
-            except OSError:
-                pass
+        # The phone may still be uploading into the newest session folder. (Any other
+        # collision just fails one upload, which the phone retries.)
+        remove_empty_dirs(root, keep_newest=True)
     print(f"offload: moved {moved} chunk(s) to {dest}", flush=True)
 
 

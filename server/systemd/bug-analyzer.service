@@ -1,0 +1,10 @@
+# Copy to ~/.config/systemd/user/ (started by bug-analyzer.timer).
+[Unit]
+Description=bug-yourself nightly analyzer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/bug-yourself/server/analyzer.py run
+# Stay out of the way of games and anything else running at night.
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,11 @@
+# Copy to ~/.config/systemd/user/ and enable with: systemctl --user enable --now bug-analyzer.timer
+[Unit]
+Description=Run the bug-yourself analyzer every night at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+# If the PC was off at midnight, run at the next boot instead.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

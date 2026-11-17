@@ -1,0 +1,17 @@
+# Copy to ~/.config/systemd/user/ and fill in the <...> values.
+[Unit]
+Description=bug-yourself receiver (uploads from the phone)
+
+[Service]
+# BUG_TOKEN=<secret> goes in this file so it isn't visible in the process list.
+EnvironmentFile=-%h/.config/bug-yourself/receiver.env
+ExecStart=/usr/bin/python3 %h/bug-yourself/server/receiver.py serve \
+    --bind <tailscale-ip> \
+    --dir %h/bug-yourself/recordings \
+    --unanalyzed-dir <hdd_root>/unanalyzed
+# Binding to the Tailscale IP fails until Tailscale is up after boot; just retry.
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

@@ -1,6 +1,6 @@
 # Analyzer plan
 
-Status: plan, not built yet. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
+Status: milestone A built (`server/analyzer.py`); B onwards planned. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
 
 The analyzer runs once a night. It finds points of interest for sampling in recordings that haven't been analyzed yet, writes them to a searchable index, cuts clips into a samples library, and moves the audio into the HDD archive.
 
@@ -49,26 +49,11 @@ Each chunk is decoded once (Ogg → 48 kHz mono float) and then passes through t
 
 **Chunk boundaries.** Each chunk is analyzed with the last 10 s of the previous chunk prepended, read from wherever that chunk now is (SSD, `unanalyzed/` or archive). Events that start inside that context are owned by the previous chunk, so nothing is counted twice. Speech that runs across a boundary gets transcribed whole.
 
-## Parallelism
+## Processing order
 
-Sessions are independent, so they're the unit of parallelism. Chunks within one session run in order, because each one needs its predecessor's tail as context.
+There's no speed requirement, so the analyzer is one sequential process. It works through chunks oldest first, one at a time: each one goes through every stage, then gets archived. Each chunk needs its predecessor's tail as context, and taking them in order keeps that simple. Models load once at the start of a run and stay loaded for the whole night, so per-chunk overhead is just the inference itself.
 
-```
-session workers (CPU processes, one session each)          GPU worker (one process)
-  decode → detect → VAD → candidate windows  ──queue──▶  tag + CLAP + Whisper, batched
-                                              ◀──queue──  results
-                      │
-                      ▼
-              DB writer (single thread, SQLite WAL) → clip cutter → migration
-```
-
-- **Session workers:** a process pool of `cores − 2` workers. Each takes one session and walks its chunks in order. Decoding and the librosa features are the CPU-heavy part and parallelize cleanly across sessions.
-- **One GPU worker:** it loads the models once, using about 5 GB of VRAM for turbo int8, the tagger and CLAP together. It pulls work from a shared queue and batches across sessions. Extra GPU processes would just load duplicate model copies; batching gives the speedup.
-- **One DB writer:** SQLite allows one writer. All results go through a single thread, and readers (search) can work during a run thanks to WAL mode.
-- **Backpressure:** the queue between CPU and GPU is bounded, so fast CPU workers can't pile up memory while Whisper works through a talkative day.
-- **Migration** runs per session as soon as all of that session's chunks are committed. It doesn't wait for the whole run, so `unanalyzed/` drains progressively.
-
-Rough cost for a full day of recording on the 3080: CPU detection about 5–10 minutes spread over the pool, GPU about 10–20 minutes depending on how much talking there was. The phone typically produces one session per Start press, so most nights have only a few sessions. Parallelism matters most when catching up after missed nights.
+Rough cost for a full day of recording on the 3080: detection about 15–30 minutes on one CPU core, GPU stages about 10–20 minutes depending on how much talking there was. That's well inside one night. A backlog after missed nights just takes proportionally longer, and the run lock stops the next night's timer from starting a second run on top.
 
 ## Migration and archive
 
