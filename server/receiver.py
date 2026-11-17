@@ -3,8 +3,8 @@
 
     python3 receiver.py serve [--dir recordings] [--bind 0.0.0.0] [--port 8675]
                               [--token SECRET] [--quality 10] [--max-size 10GB]
-                              [--when-full reject|prune] [--backup-dir HDD/unanalyzed]
-                              [--backup-at 00:05]
+                              [--when-full reject|prune] [--unanalyzed-dir HDD/unanalyzed]
+                              [--offload-at 00:05]
     python3 receiver.py join recordings/<session> [archive/<session> ...] out.wav
 
 Needs `oggenc`/`oggdec` (vorbis-tools) or `ffmpeg` built with libvorbis.
@@ -15,11 +15,15 @@ When the folder reaches --max-size, the default (--when-full reject) is to refus
 new uploads with 507; the phone keeps its files and retries, so nothing is lost
 while the analyzer catches up. --when-full prune deletes the oldest chunks instead.
 
-With --backup-dir, every finished chunk is also copied there once a day (default
-00:05 local time, and once at startup). The folder must already exist, so an
-unmounted drive is skipped rather than silently filled on the wrong disk.
+With --unanalyzed-dir, every finished chunk is moved there once a day (default
+00:05 local time, and once at startup), so the SSD working folder only ever holds
+about a day even if the analyzer is down. The analyzer reads from both folders.
+The target folder must already exist, so an unmounted drive is skipped rather
+than silently filled on the wrong disk; uploads then pile up until the 507 limit.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import os
@@ -146,37 +150,62 @@ def prune(root, max_bytes):
                 pass
 
 
-# --- nightly backup ---------------------------------------------------------
+# --- nightly offload --------------------------------------------------------
 
-def backup(root, dest):
-    """Copy every finished chunk not yet in dest. Chunks never change, so name + size = done."""
-    if not dest.is_dir():
-        print(f"backup skipped: {dest} does not exist (drive not mounted?)", flush=True)
-        return
-    copied = 0
-    for src in sorted(root.rglob("*.ogg")):
-        if not NAME_RE.match(src.name):
-            continue  # skips *.part.ogg
-        target = dest / src.parent.name / src.name
+LOCK_NAME = ".move.lock"
+
+
+@contextlib.contextmanager
+def move_lock(root):
+    """Held by whoever moves chunks out of the working folder (this offload, or the analyzer)."""
+    with open(root / LOCK_NAME, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
         try:
-            size = src.stat().st_size
-            if target.exists() and target.stat().st_size == size:
-                continue
-            target.parent.mkdir(exist_ok=True)
-            part = target.with_name(target.stem + ".part.ogg")
-            shutil.copyfile(src, part)
-            with open(part, "rb+") as f:
-                os.fsync(f.fileno())
-            if file_sha256(part) != file_sha256(src):
-                part.unlink()
-                raise OSError("copy does not match source")
-            os.replace(part, target)
-            copied += 1
-        except FileNotFoundError:
-            continue  # the analyzer moved it to the archive while we were copying
-        except OSError as e:
-            print(f"backup of {src.name} failed: {e}", flush=True)
-    print(f"backup: copied {copied} new chunk(s) to {dest}", flush=True)
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def offload(root, dest):
+    """Move every finished chunk to dest (the HDD 'unanalyzed' folder) so the SSD stays small."""
+    if not dest.is_dir():
+        print(f"offload skipped: {dest} does not exist (drive not mounted?)", flush=True)
+        return
+    moved = 0
+    with move_lock(root):
+        for src in sorted(root.rglob("*.ogg")):
+            if not NAME_RE.match(src.name):
+                continue  # skips *.part.ogg
+            target = dest / src.parent.name / src.name
+            try:
+                digest = file_sha256(src)
+                if target.exists():
+                    # Already copied by an interrupted earlier run: drop the SSD copy if identical.
+                    if file_sha256(target) != digest:
+                        print(f"offload: {target} exists with different content, leaving {src.name}", flush=True)
+                        continue
+                else:
+                    target.parent.mkdir(exist_ok=True)
+                    part = target.with_name(target.stem + ".part.ogg")
+                    shutil.copyfile(src, part)
+                    with open(part, "rb+") as f:
+                        os.fsync(f.fileno())
+                    if file_sha256(part) != digest:
+                        part.unlink()
+                        raise OSError("copy does not match source")
+                    os.replace(part, target)
+                src.unlink()
+                moved += 1
+            except OSError as e:
+                print(f"offload of {src.name} failed: {e}", flush=True)
+        # Remove emptied session folders, except the newest: the phone is still uploading
+        # into it. (Any other collision just fails one upload, which the phone retries.)
+        for d in sorted(d for d in root.iterdir() if d.is_dir())[:-1]:
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+    print(f"offload: moved {moved} chunk(s) to {dest}", flush=True)
 
 
 def next_run(at, now):
@@ -185,12 +214,12 @@ def next_run(at, now):
     return t if t > now else t + timedelta(days=1)
 
 
-def backup_loop(root, dest, at):
-    backup(root, dest)  # catch up after downtime
+def offload_loop(root, dest, at):
+    offload(root, dest)  # catch up after downtime
     while True:
         wait = (next_run(at, datetime.now()) - datetime.now()).total_seconds()
         time.sleep(max(wait, 1))
-        backup(root, dest)
+        offload(root, dest)
 
 
 # --- HTTP -------------------------------------------------------------------
@@ -295,9 +324,9 @@ def serve(args):
         stale.unlink()
     if args.when_full == "prune":
         prune(Handler.root, args.max_size)
-    if args.backup_dir:
-        threading.Thread(target=backup_loop, daemon=True,
-                         args=(Handler.root, Path(args.backup_dir).resolve(), args.backup_at)).start()
+    if args.unanalyzed_dir:
+        threading.Thread(target=offload_loop, daemon=True,
+                         args=(Handler.root, Path(args.unanalyzed_dir).resolve(), args.offload_at)).start()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     limit = f"{human(args.max_size)} ({args.when_full} when full)" if args.max_size else "unlimited"
     print(f"Saving to {Handler.root} as Ogg Vorbis q{args.quality:g} via {codec}, limit {limit}, "
@@ -366,8 +395,8 @@ def main():
                    help="Vorbis quality, -1..10 (default 10, or set BUG_QUALITY)")
     s.add_argument("--max-size", type=parse_size, default=parse_size("10GB"),
                    help="working folder size limit (default 10GB, 0 = unlimited)")
-    s.add_argument("--backup-dir", help="copy chunks here daily, e.g. an 'unanalyzed' folder on the HDD (must exist)")
-    s.add_argument("--backup-at", type=hhmm, default="00:05", help="local time for the daily backup (default 00:05)")
+    s.add_argument("--unanalyzed-dir", help="move chunks here daily, e.g. an 'unanalyzed' folder on the HDD (must exist)")
+    s.add_argument("--offload-at", type=hhmm, default="00:05", help="local time for the daily move (default 00:05)")
     s.add_argument("--when-full", choices=["reject", "prune"], default="reject",
                    help="at the limit: refuse uploads so the phone holds them (default), or delete oldest chunks")
     s.set_defaults(fn=serve)

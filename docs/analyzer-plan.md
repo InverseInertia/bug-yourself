@@ -2,22 +2,22 @@
 
 Status: plan, not built yet. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
 
-The analyzer runs once a night. It finds points of interest for sampling in the day's recordings, writes them to a searchable index, cuts clips into a samples library, and moves the day's audio from the SSD working folder to the HDD archive.
+The analyzer runs once a night. It finds points of interest for sampling in recordings that haven't been analyzed yet, writes them to a searchable index, cuts clips into a samples library, and moves the audio into the HDD archive.
 
 ## Storage layout
 
 | Folder | Drive | Owner | Size policy |
 |---|---|---|---|
-| `recordings/` (working) | SSD | receiver writes, analyzer empties | 10 GB; receiver refuses uploads when full (phone holds them) |
-| `unanalyzed/<session>/` | HDD | receiver copies in at 00:05, analyzer clears | holds only chunks not yet archived (normally ~1 day) |
+| `recordings/` (working) | SSD | receiver writes; receiver moves out at 00:05 | ~1 day; 10 GB hard cap, receiver refuses uploads when full (phone holds them) |
+| `unanalyzed/<session>/` | HDD | receiver moves chunks in at 00:05; analyzer archives them out | grows only while the analyzer is down (~2.4 GB/day) |
 | `archive/<session>/` | HDD | analyzer | 500 GB; oldest chunks deleted first |
 | `samples/` | HDD | analyzer | never pruned automatically |
 | `analyzer.db` (SQLite) | HDD, next to archive | analyzer | small (MBs per day) |
 | model cache, venv | SSD | analyzer | ~5 GB once |
 
-The SSD folder normally holds less than a day (~2.4 GB at ~100 MB/hour). The 10 GB cap only matters if the analyzer stops running. Then the receiver refuses uploads with 507 and the phone keeps buffering, so a broken analyzer costs nothing until the phone fills up. The receiver no longer deletes anything by default; deletion only happens in the archive.
+Unanalyzed audio can be in two places: chunks that arrived since 00:05 are still on the SSD, and everything older is in `unanalyzed/` on the HDD. The analyzer checks both.
 
-The receiver also copies every finished chunk to `unanalyzed/` on the HDD each night at 00:05, and once at startup to catch up after downtime. Until a chunk is archived, it exists on both drives, so an SSD failure or a broken analyzer loses nothing that's more than a day old. The receiver only copies into `unanalyzed/` if that folder already exists, so an unmounted HDD is skipped rather than filled onto the SSD.
+Every night at 00:05, and once at startup to catch up after downtime, the receiver moves every finished chunk from the SSD to `unanalyzed/`. Each copy is verified by SHA-256 before the SSD copy is deleted. The SSD therefore holds about a day of audio no matter whether the analyzer works; a broken analyzer just lets `unanalyzed/` grow on the HDD. The receiver only moves into `unanalyzed/` if that folder already exists. If the HDD isn't mounted, nothing moves; the SSD then fills, and at 10 GB (about 4 days) the receiver refuses uploads with 507, the phone keeps buffering, and nothing is lost.
 
 The HDD root holds a marker file (`.bug-yourself-archive`). The analyzer refuses to run if it's missing. That stops it from "archiving" onto the SSD when the HDD isn't mounted.
 
@@ -25,7 +25,7 @@ The HDD root holds a marker file (`.bug-yourself-archive`). The analyzer refuses
 
 A systemd **user** timer starts it at 00:00 with `Persistent=true`, so a run missed because the PC was off happens at the next boot. A lock file prevents two runs from overlapping. It can also be run by hand, which is useful while tuning.
 
-Each run handles every finished chunk in the working folder (`*.ogg`, never `*.part.*`). It doesn't treat chunks of a session that's still recording any differently. Tonight takes whatever exists, and tomorrow picks up the rest, using the archived chunk from tonight as context (see "Chunk boundaries").
+Each run handles every finished chunk in either location: `unanalyzed/` on the HDD and the SSD working folder (`*.ogg`, never `*.part.*`), skipping chunks the DB already marks done. A chunk is identified by its name, wherever it currently sits. It doesn't treat chunks of a session that's still recording any differently. Tonight takes whatever exists, and tomorrow picks up the rest, using the archived chunk from tonight as context (see "Chunk boundaries").
 
 The GPU is shared with gaming. Midnight usually avoids conflict, but the run checks `nvidia-smi` first. If another process is holding more than a few GB of VRAM, it waits and re-checks rather than competing. CPU-only stages can proceed meanwhile.
 
@@ -46,7 +46,7 @@ Each chunk is decoded once (Ogg → 48 kHz mono float) and then passes through t
 - **Transcribe (GPU, faster-whisper large-v3-turbo, 8-bit).** Runs on the speech regions, with word timestamps. Segments whose confidence suggests invented text (high no-speech probability, very low average log-probability) are dropped.
 - **Clip.** Each kept candidate is cut with 50 ms of padding and short fades, and written to `samples/<kind>/<label>_<yyyymmdd>_<id>.flac`. FLAC avoids a second round of lossy encoding. The label comes from the tagger, e.g. `glass_20261117_a3f9.flac`; `untagged_…` is used when the tagger isn't confident.
 
-**Chunk boundaries.** Each chunk is analyzed with the last 10 s of the previous chunk prepended, read from the working folder or the archive. Events that start inside that context are owned by the previous chunk, so nothing is counted twice. Speech that runs across a boundary gets transcribed whole.
+**Chunk boundaries.** Each chunk is analyzed with the last 10 s of the previous chunk prepended, read from wherever that chunk now is (SSD, `unanalyzed/` or archive). Events that start inside that context are owned by the previous chunk, so nothing is counted twice. Speech that runs across a boundary gets transcribed whole.
 
 ## Parallelism
 
@@ -65,26 +65,26 @@ session workers (CPU processes, one session each)          GPU worker (one proce
 - **One GPU worker:** it loads the models once, using about 5 GB of VRAM for turbo int8, the tagger and CLAP together. It pulls work from a shared queue and batches across sessions. Extra GPU processes would just load duplicate model copies; batching gives the speedup.
 - **One DB writer:** SQLite allows one writer. All results go through a single thread, and readers (search) can work during a run thanks to WAL mode.
 - **Backpressure:** the queue between CPU and GPU is bounded, so fast CPU workers can't pile up memory while Whisper works through a talkative day.
-- **Migration** runs per session as soon as all of that session's chunks are committed. It doesn't wait for the whole run, so the SSD frees up progressively.
+- **Migration** runs per session as soon as all of that session's chunks are committed. It doesn't wait for the whole run, so `unanalyzed/` drains progressively.
 
 Rough cost for a full day of recording on the 3080: CPU detection about 5–10 minutes spread over the pool, GPU about 10–20 minutes depending on how much talking there was. The phone typically produces one session per Start press, so most nights have only a few sessions. Parallelism matters most when catching up after missed nights.
 
 ## Migration and archive
 
-For each analyzed chunk, the analyzer:
-- copies it to `archive/<session>/<name>.part.ogg` on the HDD and fsyncs it
+For each analyzed chunk, from whichever folder it's in, the analyzer:
+- copies it to `archive/<session>/<name>.part.ogg` and fsyncs it (from `unanalyzed/` this is a same-drive rename, so it's instant)
 - verifies the copy's size and SHA-256 against the source
-- renames it into place, then deletes the SSD copy
+- renames it into place, then deletes the source copy
 
-If the destination already exists with the same hash, the SSD copy is just deleted, which covers a crash mid-migration. Once a chunk is archived, its copy in `unanalyzed/` is deleted too.
+If the destination already exists with the same hash, the source copy is just deleted, which covers a crash mid-migration.
 
-The analyzer (00:00) and the receiver's backup (00:05) overlap on a long night, and both sides tolerate it. The backup skips a chunk that disappears mid-copy. A backup that lands after the analyzer already archived that chunk leaves a stray copy, which the next run deletes: any `unanalyzed/` file whose chunk the DB marks `migrated` gets removed. If an SSD chunk is missing or fails to decode, the analyzer uses the `unanalyzed/` copy instead. Chunk state lives in the DB (`analyzed`, `migrated`), so a crash at any point resumes cleanly.
+The analyzer (00:00) and the receiver's move (00:05) can overlap on a long night. Both take an exclusive lock on `recordings/.move.lock` (already implemented in the receiver) while moving files out of the SSD folder, so they never move the same file at once. The analyzer holds it only while moving SSD chunks, not while analyzing. A chunk can also move from the SSD to `unanalyzed/` while the analyzer is reading it. An open file stays readable on Linux, and at archive time the analyzer looks the chunk up again by name in both folders.
 
-If a chunk fails analysis three nights running, it's migrated anyway and marked `analysis_failed`. This keeps one bad file from clogging the SSD. `analyzer.py reanalyze` can retry it from the archive later.
+If a chunk fails analysis three nights running, it's archived anyway and marked `analysis_failed`, so one bad file never sits in `unanalyzed/` forever. `analyzer.py reanalyze` can retry it from the archive later.
 
 After migration, the archive is pruned to 500 GB (the receiver's `prune()` logic, reused). Pruning touches only archive chunks; `samples/` and the DB are never deleted. DB rows for pruned audio stay, marked `audio_pruned`, so transcripts and tags remain searchable even after the source audio is gone, and the clips in `samples/` survive.
 
-`receiver.py join` already accepts several folders, so a session split between the working folder and the archive can still be joined.
+`receiver.py join` already accepts several folders, so a session spread over the SSD, `unanalyzed/` and the archive can still be joined.
 
 ## Data model (SQLite)
 
@@ -123,7 +123,7 @@ Each milestone is useful on its own:
 | D | VAD + Whisper transcripts, `find-text` | yes |
 | E | web browser for results | no |
 
-Milestone A is needed before anything else, because without it the SSD working folder fills in about four days and uploads stop.
+Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by about 2.4 GB a day with nothing archiving or pruning it.
 
 ## Open questions
 

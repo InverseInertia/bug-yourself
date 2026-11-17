@@ -19,7 +19,7 @@ The default port is 8675. Chunks land in `recordings/<session>/<session>_<seq>.o
 - `--quality` sets the Vorbis quality, -1 to 10 (default 10, about 250 kbps on dense material). You can also set it with the `BUG_QUALITY` environment variable. It applies to chunks that arrive after you change it.
 - `--max-size` caps the working folder (default `10GB`, `0` for no limit). When it's full, the receiver refuses uploads with 507 and the phone keeps its files and retries, so nothing is lost. `--when-full prune` deletes the oldest chunks instead. The working folder is meant to live on the SSD; the analyzer moves each night's audio to the HDD archive (see [docs/analyzer-plan.md](docs/analyzer-plan.md)).
 
-- `--backup-dir` copies every finished chunk to a second folder, e.g. `unanalyzed/` on the HDD. It runs daily at `--backup-at` (default `00:05`, local time) and once at startup. The folder must already exist; if it's missing (drive not mounted), the backup is skipped and logged.
+- `--unanalyzed-dir` moves every finished chunk off the working folder to a second folder, e.g. `unanalyzed/` on the HDD. It runs daily at `--offload-at` (default `00:05`, local time) and once at startup, and verifies each copy before deleting the original. This keeps the SSD to about a day of audio even if the analyzer isn't running. The folder must already exist; if it's missing (drive not mounted), nothing moves and the problem is logged.
 
 To stitch a session into one file (list both folders if part of it has already moved to the archive):
 
