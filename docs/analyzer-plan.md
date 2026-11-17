@@ -123,7 +123,26 @@ A CLI first:
 - `cut <event-id> --pad 200ms`
 - `reanalyze`
 
-Results print with clip paths, so they open straight in a sampler or DAW. A small local web page (waveforms, play buttons, search box) can come later, built on the same DB.
+Results print with clip paths, so they open straight in a sampler or DAW.
+
+## Review web app
+
+This is the main way to look at results and the tool for tuning the detector. `analyzer.py web` serves it from the PC, like the receiver: bound to the Tailscale IP, protected by the same token, so it works from the phone too. Its pages:
+
+- **Proposed:** new clips in `samples-new/` (SSD) and the library in `samples/` (HDD). Filters for kind, tag, date and score, sorted by score or time.
+- **Kept:** the folder(s) you move keepers into, set by a `--kept-dir` option. It browses whatever audio is there, including long clips you've cut yourself. A kept file still carrying its original name is linked back to its index entry, so its source, time, tags and transcript show alongside it. Files from anywhere else just play.
+- **Search:** CLAP text search ("metallic ring") and transcript search, with results shown in the same click-through player.
+
+**Player.** Opening any list gives a click-through view: one clip at a time with a waveform and spectrogram drawn in the browser, plus next/previous. Keyboard shortcuts let you get through a night's proposals in minutes: space plays, arrow keys step, `w` widens. Widen replays the clip with a few seconds of surrounding audio from the source recording (SSD, `unanalyzed/` or archive, wherever it is), so you can hear whether a better cut sits just outside the proposal. If the source has been pruned, widen is greyed out.
+
+**Rating for tuning.** Each proposed clip can be marked good or bad with one key. Ratings go into the DB, never move or delete files, and are separate from keeping: you still move keepers out by hand. A **Tuning** page uses the ratings:
+- shows, for each kind (tonal, percussive, loop, texture), how often top-scored proposals were rated good
+- has a slider for each kind's score cutoff and per-hour quota, which re-ranks the existing proposals live (scores are already in the DB, so this is just a query). You can hear what a stricter or looser setting would have proposed before saving it.
+- writes saved settings to the analyzer config; the next nightly run uses them.
+
+Feature weights inside each score (how much onset strength vs. decay vs. isolation counts) are tuned the same way. Once a few hundred ratings exist, a small fit (logistic regression over the stored features) can suggest weights, which you then audition on the Tuning page before accepting.
+
+**Build.** A single-page app with plain HTML and JavaScript, served by a small Python web server inside the analyzer, reading the same SQLite DB. Audio and waveforms are decoded in the browser from the clip files; there's no server-side rendering and no extra service to run.
 
 ## Environment (Bazzite)
 
@@ -137,13 +156,12 @@ Each milestone is useful on its own:
 |---|---|---|
 | A | nightly timer, migration to HDD, archive and samples pruning, chunk state DB | no |
 | B | tonal / percussive / loop / texture detection, clip cutting, `list` | no |
-| C | AudioSet tags in clip names, CLAP `search` | yes |
-| D | VAD + Whisper transcripts, `find-text` | yes |
-| E | web browser for results | no |
+| C | review web app: proposed/kept pages, click-through player, widen, ratings, Tuning page | no |
+| D | AudioSet tags in clip names, CLAP search (CLI and web) | yes |
+| E | VAD + Whisper transcripts, transcript search (CLI and web) | yes |
 
-Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by about 2.4 GB a day with nothing archiving or pruning it.
+Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by about 2.4 GB a day with nothing archiving or pruning it. The web app comes right after detection, because detection can only be tuned by listening to what it proposes.
 
-## Open questions
+## Deferred
 
-- **Speaker labels** (pyannote): add later if transcripts are used a lot. They need a Hugging Face token and about 1 GB more VRAM.
-- **Tuning:** scoring needs listening sessions on real recordings. Plan a feedback command (`keep`/`reject` on clips) and use those labels to tune thresholds.
+- **Speaker labels** (pyannote): not wanted for now. Transcripts are stored with sample positions, so labels can be added later without re-transcribing.
