@@ -1,6 +1,6 @@
 # Analyzer plan
 
-Status: milestones A and B built (`server/analyzer.py`, `detect.py`, `sampling.py`); C onwards planned. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
+Status: milestones A, B and C built (`server/analyzer.py`, `detect.py`, `sampling.py`, `web.py`); D onwards planned. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
 
 The analyzer runs once a night. It finds points of interest for sampling in recordings that haven't been analyzed yet, writes them to a searchable index, cuts clips into a samples library, and moves the audio into the HDD archive.
 
@@ -134,6 +134,8 @@ This is the main way to look at results and the tool for tuning the detector. `a
 
 Feature weights inside each score (how much onset strength vs. decay vs. isolation counts) are tuned the same way. Once a few hundred ratings exist, a small fit (logistic regression over the stored features) can suggest weights, which you then audition on the Tuning page before accepting.
 
+**As built (milestone C).** `analyzer.py web` (service `bug-web`, port 8676), with the token entered once and kept in a cookie. Ratings live in a `ratings` table. The Search page waits for milestones D (CLAP) and E (transcripts), and so do their CLI commands. Suggested feature weights are left until there are a few hundred real ratings to fit them to. The Tuning page already shows, per kind, how ratings fall across the score range, which is what a weight fit would use.
+
 **Build.** A single-page app with plain HTML and JavaScript, served by a small Python web server inside the analyzer, reading the same SQLite DB. Audio and waveforms are decoded in the browser from the clip files; there's no server-side rendering and no extra service to run.
 
 ## Environment (Bazzite)
@@ -148,7 +150,7 @@ Each milestone is useful on its own:
 |---|---|---|
 | A (built) | nightly timer, migration to HDD, archive and samples pruning, chunk state DB | no |
 | B (built) | tonal / percussive / loop / texture detection, clip cutting, `list`, `cut`, `reanalyze` | no |
-| C | review web app: proposed/kept pages, click-through player, widen, ratings, Tuning page | no |
+| C (built) | review web app: proposed/kept pages, click-through player, widen, ratings, Tuning page | no |
 | D | AudioSet tags in clip names, CLAP search (CLI and web) | yes |
 | E | VAD + Whisper transcripts, transcript search (CLI and web) | yes |
 

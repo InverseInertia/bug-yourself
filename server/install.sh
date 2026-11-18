@@ -15,7 +15,7 @@ UNIT_DIR=$CONFIG_HOME/systemd/user
 RECEIVER_ENV=$CFG/receiver.env
 ANALYZER_TOML=$CFG/analyzer.toml
 INSTALL_CONF=$CFG/install.conf
-UNITS=(bug-receiver.service bug-analyzer.service bug-analyzer.timer)
+UNITS=(bug-receiver.service bug-web.service bug-analyzer.service bug-analyzer.timer)
 MARKER=.bug-yourself-archive
 VENV=${XDG_DATA_HOME:-$HOME/.local/share}/bug-yourself/venv
 
@@ -92,6 +92,7 @@ load_existing() {
         SAMPLES_NEW=$(sed -n 's/^samples_new_dir *= *"\(.*\)"$/\1/p' "$ANALYZER_TOML")
         ARCHIVE_MAX=$(sed -n 's/^archive_max *= *"\(.*\)"$/\1/p' "$ANALYZER_TOML")
         SAMPLES_MAX=$(sed -n 's/^samples_max *= *"\(.*\)"$/\1/p' "$ANALYZER_TOML")
+        KEPT_DIR=$(sed -n 's/^kept_dirs *= *\[ *"\([^"]*\)".*$/\1/p' "$ANALYZER_TOML")
     fi
     return 0
 }
@@ -112,7 +113,8 @@ configure() {
     local ts_ip
     ts_ip=$(tailscale ip -4 2>/dev/null | head -n1 || true)
     BUG_BIND=$(ask "Address to listen on (your Tailscale IP)" "${BUG_BIND:-${ts_ip:-0.0.0.0}}")
-    BUG_PORT=$(ask "Port" "${BUG_PORT:-8675}")
+    BUG_PORT=$(ask "Upload port" "${BUG_PORT:-8675}")
+    BUG_WEB_PORT=$(ask "Review app port" "${BUG_WEB_PORT:-8676}")
     BUG_DIR=$(abspath "$(ask "SSD working folder for incoming recordings" "${BUG_DIR:-$HOME/bug-yourself/recordings}")")
     SAMPLES_NEW=$(abspath "$(ask "SSD folder for each night's new clips" "${SAMPLES_NEW:-$HOME/bug-yourself/samples-new}")")
 
@@ -121,6 +123,10 @@ configure() {
         suggest_hdd
     fi
     HDD_ROOT=$(abspath "$(ask "HDD folder" "${HDD_ROOT:-}")")
+    local keep
+    read -r -p "Folder you move keepers into, browsable in the review app (blank: none)${KEPT_DIR:+ [$KEPT_DIR]}: " keep || true
+    keep=${keep:-${KEPT_DIR:-}}
+    KEPT_DIR=${keep:+$(abspath "$keep")}
     ARCHIVE_MAX=$(ask "Archive size cap" "${ARCHIVE_MAX:-500GB}")
     SAMPLES_MAX=$(ask "Samples library size cap" "${SAMPLES_MAX:-100GB}")
 
@@ -149,6 +155,7 @@ configure() {
 # bug-yourself receiver settings (read by bug-receiver.service). Edit, then run server/install.sh.
 BUG_BIND=$(quote "$BUG_BIND")
 BUG_PORT=$(quote "$BUG_PORT")
+BUG_WEB_PORT=$(quote "$BUG_WEB_PORT")
 BUG_DIR=$(quote "$BUG_DIR")
 BUG_UNANALYZED_DIR=$(quote "$HDD_ROOT/unanalyzed")
 BUG_TOKEN=$(quote "$BUG_TOKEN")
@@ -157,9 +164,12 @@ BUG_QUALITY=$(quote "${BUG_QUALITY:-10}")
 BUG_EXTRA_ARGS=$(quote "${BUG_EXTRA_ARGS:-}")
 EOF
     umask 022
+    local kept_toml=""
+    [[ -n ${KEPT_DIR-} ]] && kept_toml="\"$KEPT_DIR\""
     cat > "$ANALYZER_TOML" <<EOF
 # bug-yourself analyzer settings. Edit freely; server/install.sh only rewrites
 # this file with --reconfigure.
+kept_dirs = [$kept_toml]
 working_dir = "$BUG_DIR"
 hdd_root = "$HDD_ROOT"
 samples_new_dir = "$SAMPLES_NEW"
@@ -247,12 +257,13 @@ install_services() {
     say "== Installing services from $REPO"
     render "$REPO/server/systemd/bug-receiver.service" "$RECEIVER_PYTHON" "$UNIT_DIR/bug-receiver.service"
     render "$REPO/server/systemd/bug-analyzer.service" "$ANALYZER_PYTHON" "$UNIT_DIR/bug-analyzer.service"
+    render "$REPO/server/systemd/bug-web.service" "$ANALYZER_PYTHON" "$UNIT_DIR/bug-web.service"
     render "$REPO/server/systemd/bug-analyzer.timer" "" "$UNIT_DIR/bug-analyzer.timer"
 
     systemctl --user daemon-reload
-    systemctl --user enable --quiet bug-receiver.service bug-analyzer.timer
+    systemctl --user enable --quiet bug-receiver.service bug-web.service bug-analyzer.timer
     # Restart so a pulled update takes effect now. The phone retries the brief gap.
-    systemctl --user restart bug-receiver.service
+    systemctl --user restart bug-receiver.service bug-web.service
     systemctl --user start bug-analyzer.timer
 
     if [[ $(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || true) != yes ]]; then
@@ -272,6 +283,11 @@ report() {
     else
         warn "receiver isn't running yet (it retries every 15 s). Logs: journalctl --user -u bug-receiver -n 30"
     fi
+    if systemctl --user is-active --quiet bug-web.service; then
+        say "review app: http://$BUG_BIND:$BUG_WEB_PORT  (sign in with the token below)"
+    else
+        warn "review app isn't running yet. Logs: journalctl --user -u bug-web -n 30"
+    fi
     say "analyzer: next run $(systemctl --user show bug-analyzer.timer --property=NextElapseUSecRealtime --value 2>/dev/null || echo 'at midnight')"
     $ANALYZER_PYTHON "$REPO/server/analyzer.py" --config "$ANALYZER_TOML" status 2>&1 | sed 's/^/  /' || true
     say ""
@@ -283,7 +299,7 @@ report() {
 }
 
 uninstall() {
-    systemctl --user disable --now bug-receiver.service bug-analyzer.timer 2>/dev/null || true
+    systemctl --user disable --now bug-receiver.service bug-web.service bug-analyzer.timer 2>/dev/null || true
     for u in "${UNITS[@]}"; do rm -f "$UNIT_DIR/$u"; done
     systemctl --user daemon-reload
     say "Services removed. Settings ($CFG) and recordings were left in place."
@@ -321,6 +337,11 @@ if [[ $mode == reconfigure || ! -f $RECEIVER_ENV || ! -f $ANALYZER_TOML || ! -f 
 else
     load_existing
     prepare_hdd
+    # Settings added by later versions: give existing installs their defaults.
+    if ! grep -q '^BUG_WEB_PORT=' "$RECEIVER_ENV"; then
+        printf 'BUG_WEB_PORT="8676"\n' >> "$RECEIVER_ENV"
+        say "Added BUG_WEB_PORT=8676 (review app) to $RECEIVER_ENV"
+    fi
 fi
 host_has_codec || [[ ${RECEIVER_PYTHON-} == *distrobox* ]] \
     || warn "no Vorbis encoder on the host; the receiver will exit until ffmpeg/oggenc is available (or rerun with --reconfigure to use a distrobox)"

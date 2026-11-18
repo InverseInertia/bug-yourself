@@ -6,6 +6,7 @@
     analyzer.py list       [--kind K] [--since 7d] [--all] [--limit N]
     analyzer.py cut        EVENT_ID [--pad 0.5] [--out DIR]
     analyzer.py reanalyze  [--prefix 20261117] [--since 7d]
+    analyzer.py web        [--bind IP] [--port 8676]   the review app (token: BUG_TOKEN)
     (all take --config FILE)
 
 Each run finds unanalyzed chunks on the SSD working folder and in the HDD
@@ -59,6 +60,8 @@ class Config:
     samples_max: int
     quota: dict           # clips per hour, per kind
     min_score: dict       # minimum score to become a clip, per kind
+    kept_dirs: list       # where you move keepers; browsable in the web app
+    path: Path = None     # the config file, so the web app can save tuning changes
 
     @property
     def unanalyzed_dir(self): return self.hdd_root / "unanalyzed"
@@ -84,6 +87,8 @@ def load_config(path):
             samples_max=parse_size(raw.get("samples_max", "100GB")),
             quota={**DEFAULT_QUOTA, **raw.get("detect", {}).get("quota_per_hour", {})},
             min_score={**DEFAULT_MIN_SCORE, **raw.get("detect", {}).get("min_score", {})},
+            kept_dirs=[Path(d).expanduser() for d in raw.get("kept_dirs", [])],
+            path=Path(path),
         )
     except KeyError as e:
         sys.exit(f"config is missing {e}")
@@ -129,6 +134,11 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_by_chunk ON events(chunk);
 CREATE INDEX IF NOT EXISTS events_by_time ON events(at_time);
+CREATE TABLE IF NOT EXISTS ratings (
+    event_id  INTEGER PRIMARY KEY,      -- your verdict on a detected moment, for tuning
+    rating    INTEGER NOT NULL,         -- 1 = good, -1 = bad
+    rated_at  REAL NOT NULL
+);
 """
 # Columns added after milestone A; existing databases get them on open.
 CHUNK_COLUMNS = {"start_sample": "INTEGER", "frames": "INTEGER", "sr": "INTEGER", "detect_version": "INTEGER"}
@@ -185,6 +195,40 @@ def analyze(db, name, path, stages):
 
 # --- the nightly run ----------------------------------------------------------
 
+def locate_chunk(cfg, name, archive=True):
+    """Where a chunk is right now: SSD, unanalyzed/ or (optionally) the archive."""
+    legacy = LEGACY_RE.match(name)
+    roots = (cfg.unanalyzed_dir, cfg.working_dir) + ((cfg.archive_dir,) if archive else ())
+    for root in roots:
+        p = root / (legacy["session"] if legacy else day_folder(name)) / name
+        if p.exists():
+            return p
+    return None
+
+
+def save_detect_settings(path, quota, min_score):
+    """Rewrite the two tuning settings under [detect] in analyzer.toml, keeping
+    everything else (other sections, comments) as it is."""
+    lines = Path(path).read_text().splitlines()
+    fmt = lambda d, f: "{ " + ", ".join(f"{k} = {f(v)}" for k, v in d.items()) + " }"
+    settings = ["quota_per_hour = " + fmt(quota, lambda v: str(int(v))),
+                "min_score = " + fmt(min_score, lambda v: f"{float(v):.2f}")]
+    start = next((i for i, l in enumerate(lines) if l.strip() == "[detect]"), None)
+    if start is None:
+        lines += ["", "[detect]"] + settings
+    else:
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+        body = [l for l in lines[start + 1:end]
+                if l.split("=")[0].strip() not in ("quota_per_hour", "min_score")]
+        while body and not body[-1].strip():
+            body.pop()
+        lines = lines[:start + 1] + body + settings + ([""] if end < len(lines) else []) + lines[end:]
+    text = "\n".join(lines) + "\n"
+    tomllib.loads(text)  # never leave a broken config behind
+    tmp = Path(path).with_suffix(".toml.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
 def dir_files(root):
     return [p for p in root.rglob("*") if p.is_file()] if root.is_dir() else []
 
@@ -233,13 +277,7 @@ class Run:
 
     def locate(self, name, archive=False):
         """Chunks can move from the SSD to unanalyzed/ (receiver, 00:05) mid-run: look again."""
-        roots = (self.cfg.unanalyzed_dir, self.cfg.working_dir) + ((self.cfg.archive_dir,) if archive else ())
-        legacy = LEGACY_RE.match(name)
-        for root in roots:
-            p = root / (legacy["session"] if legacy else day_folder(name)) / name
-            if p.exists():
-                return p
-        return None
+        return locate_chunk(self.cfg, name, archive)
 
     def locate_any(self, name):
         return self.locate(name, archive=True)
@@ -617,6 +655,12 @@ def use_venv_if_needed():
         os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), *sys.argv])
 
 
+def cmd_web(cfg, args):
+    check_hdd(cfg)
+    import web
+    web.serve(cfg, sys.modules[__name__], args.bind, args.port, args.token or os.environ.get("BUG_TOKEN", ""))
+
+
 def main():
     use_venv_if_needed()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -643,6 +687,11 @@ def main():
                                      "e.g. 20261117 for a day or 20261117T20 for an hour")
     ra.add_argument("--since", type=parse_age, help="only chunks archived within, e.g. 7d")
     ra.set_defaults(fn=cmd_reanalyze)
+    w = sub.add_parser("web", help="the review app: browse, rate and tune in a browser")
+    w.add_argument("--bind", default="127.0.0.1", help="your Tailscale IP to reach it from the phone")
+    w.add_argument("--port", type=int, default=8676)
+    w.add_argument("--token", help="sign-in token (default: BUG_TOKEN, the same as the receiver's)")
+    w.set_defaults(fn=cmd_web)
     args = ap.parse_args()
     args.fn(load_config(args.config), args)
 

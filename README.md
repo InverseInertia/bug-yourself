@@ -61,6 +61,15 @@ python3 server/analyzer.py list
 
 `list` shows proposed clips; `--all` includes everything detected, `--kind tonal` filters, and `--best` sorts by score. `cut <id> --pad 1` re-cuts a moment with a second of extra audio either side, and `reanalyze` runs detection over chunks that are already archived (for example everything recorded before detection existed). Clip counts and score cutoffs are set under `[detect]` in `analyzer.toml`.
 
+### Review app
+
+The review app runs at `http://<tailscale-ip>:8676` and works on the phone too; sign in with the same token as uploads. It has three pages:
+- **Proposed** steps through the clips with a waveform and spectrogram. **Widen** replays a clip with 3 s of the surrounding recording, so you can hear whether a better cut sits just outside it.
+- **Kept** browses the folders you move keepers into (`kept_dirs` in `analyzer.toml`). A kept clip that still has its original name is linked back to where it came from.
+- **Tuning** shows, for each kind, a score histogram coloured by your ratings. A slider for the score cutoff and one for clips per hour re-rank the stored scores instantly. "Listen to this setting" plays exactly what that setting would cut, including moments that aren't clips yet. Saving writes `[detect]` in `analyzer.toml` for the next nightly run.
+
+Keys: `space` play, `←`/`→` step, `W` widen, `G`/`B` rate good/bad, `0` clear the rating. Ratings never move or delete files.
+
 Housekeeping needs only Python 3.11+. Detection needs numpy, scipy and soundfile; the installer puts them in a private virtualenv. Without them, chunks wait in `unanalyzed/` instead of being archived undetected. Configuration lives in `~/.config/bug-yourself/analyzer.toml` (template: `server/analyzer.example.toml`). The HDD folder must contain an empty `.bug-yourself-archive` marker file, or the analyzer refuses to run, so an unmounted drive is never treated as empty.
 
 ```bash

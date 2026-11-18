@@ -1,5 +1,9 @@
 # Copy to ~/.config/bug-yourself/analyzer.toml and adjust the paths.
 
+# Folders you move keepers into; the review app's Kept page shows them.
+# Must stay above the [detect] section (TOML puts later keys inside a section).
+kept_dirs = ["~/Music/keepers"]
+
 # SSD folder the receiver writes into (receiver --dir).
 working_dir = "~/bug-yourself/recordings"
 

@@ -1,0 +1,14 @@
+# Template: server/install.sh fills in @REPO@ and @PYTHON@ and installs it to
+# ~/.config/systemd/user/. Address, port and token come from receiver.env.
+[Unit]
+Description=bug-yourself review app (browse, rate, tune)
+
+[Service]
+EnvironmentFile=%h/.config/bug-yourself/receiver.env
+ExecStart=@PYTHON@ @REPO@/server/analyzer.py web --bind ${BUG_BIND} --port ${BUG_WEB_PORT}
+# Retries until Tailscale is up after boot (and while the HDD isn't mounted).
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
