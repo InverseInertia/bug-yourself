@@ -53,7 +53,15 @@ Pending audio lives in `Android/data/com.bugyourself/files/outbox/` and survives
 
 `server/analyzer.py` runs every night at midnight. It archives the day's chunks from the SSD working folder and the HDD `unanalyzed/` folder into `archive/`, keeps the archive under 500 GB and the samples library under 100 GB (deleting the oldest first), and moves the previous night's clips from the SSD into the library. Detection, tagging and transcription plug into the same run later; see [docs/analyzer-plan.md](docs/analyzer-plan.md).
 
-It needs only Python 3.11+, so it runs directly on Bazzite. Configuration lives in `~/.config/bug-yourself/analyzer.toml` (template: `server/analyzer.example.toml`). The HDD folder must contain an empty `.bug-yourself-archive` marker file, or the analyzer refuses to run, so an unmounted drive is never treated as empty.
+Each run also looks for sample-worthy moments: isolated hits, held notes, steady rhythms and textures. It cuts the best few per hour into 24-bit FLAC clips in `samples-new/<kind>/`, named by note, tempo or kind (e.g. `E4_20261117_00033.flac`). Every detected moment is kept in the database with its score, so you can change how many become clips without re-running detection.
+
+```bash
+python3 server/analyzer.py list
+```
+
+`list` shows proposed clips; `--all` includes everything detected, `--kind tonal` filters, and `--best` sorts by score. `cut <id> --pad 1` re-cuts a moment with a second of extra audio either side, and `reanalyze` runs detection over chunks that are already archived (for example everything recorded before detection existed). Clip counts and score cutoffs are set under `[detect]` in `analyzer.toml`.
+
+Housekeeping needs only Python 3.11+. Detection needs numpy, scipy and soundfile; the installer puts them in a private virtualenv. Without them, chunks wait in `unanalyzed/` instead of being archived undetected. Configuration lives in `~/.config/bug-yourself/analyzer.toml` (template: `server/analyzer.example.toml`). The HDD folder must contain an empty `.bug-yourself-archive` marker file, or the analyzer refuses to run, so an unmounted drive is never treated as empty.
 
 ```bash
 python3 server/analyzer.py run --dry-run

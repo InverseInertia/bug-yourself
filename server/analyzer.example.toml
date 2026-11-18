@@ -15,3 +15,10 @@ samples_new_dir = "~/bug-yourself/samples-new"
 # Oldest chunks / clips are deleted once these are exceeded.
 archive_max = "500GB"
 samples_max = "100GB"
+
+[detect]
+# How many clips to cut per hour of recording, per kind, and the minimum score
+# (0-1) a moment needs to become a clip. Everything detected is kept in the
+# database either way (analyzer.py list --all), so these can be changed later.
+quota_per_hour = { percussive = 6, tonal = 4, loop = 2, texture = 2 }
+min_score = { percussive = 0.75, tonal = 0.6, loop = 0.6, texture = 0.6 }

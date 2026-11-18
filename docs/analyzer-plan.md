@@ -1,6 +1,6 @@
 # Analyzer plan
 
-Status: milestone A built (`server/analyzer.py`); B onwards planned. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
+Status: milestones A and B built (`server/analyzer.py`, `detect.py`, `sampling.py`); C onwards planned. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
 
 The analyzer runs once a night. It finds points of interest for sampling in recordings that haven't been analyzed yet, writes them to a searchable index, cuts clips into a samples library, and moves the audio into the HDD archive.
 
@@ -34,20 +34,25 @@ The GPU is shared with gaming. Midnight usually avoids conflict, but the run che
 
 Each chunk is decoded once (Ogg → 48 kHz mono float) and then passes through these stages:
 
-- **Detect (CPU, librosa).** Harmonic/percussive separation, onset strength, pitch tracking (pYIN) and spectral flatness produce candidate windows of four kinds:
+- **Detect (CPU, numpy/scipy; built in milestone B as `server/detect.py`).** Harmonic/percussive separation (median filtering on 96 log-spaced bands), spectral-flux onsets, spectral flatness and YIN pitch tracking produce candidates of four kinds. librosa was avoided: it depends on numba, which lags new Python releases, and Bazzite's host Python is recent.
   - **tonal:** a stable pitch with high confidence for at least 0.5 s, low flatness
   - **percussive:** a strong onset, fast decay, quiet before and after (clean one-shots)
   - **loop:** a stretch where beat tracking is consistent for several bars
   - **texture:** sustained, broadband, but with stable spectral character (drones, rain, crowd)
 
-  Each candidate gets a 0–1 score. Rather than fixed thresholds, the top N per hour by score are kept, because phone-mic audio is mostly background noise.
+  Each candidate gets a 0–1 score built from the features stored with it. All candidates go into the DB; only the best per hour and kind become clips (`[detect]` in analyzer.toml: `quota_per_hour`, `min_score`, defaulting to 6 percussive, 4 tonal, 2 loop and 2 texture per hour). Ranking rather than fixed thresholds, because phone-mic audio is mostly background noise.
+
+  What milestone B detection doesn't do yet:
+  - **Speech isn't excluded.** Voices will show up as tonal and percussive candidates until voice detection arrives with transcription (milestone E). The isolation and pitch-stability terms keep most speech below the clip cutoffs.
+  - **Steady sounds lasting a whole chunk aren't tonal candidates.** Tonal detection measures against the chunk's own floor, so a fridge hum lasting the whole chunk isn't found. Steady broadband sound is caught as texture, because texture is measured against an absolute quiet reference (−60 dBFS).
+  - **The last 10 s of a session's final chunk are never owned**, because the next chunk normally owns them. Those 10 s are lost to detection if the session ends there.
 - **Voice detection (CPU, Silero VAD).** Speech regions feed transcription and are excluded from the tonal/texture candidates.
 - **Tag (GPU, PANNs or BEATs).** Candidate windows get AudioSet labels with confidences. The top label becomes part of the clip name.
 - **Embed (GPU, CLAP).** Every candidate gets a 512-dim embedding, plus one embedding per 10 s window of the whole day for open-ended search. Stored as blobs and searched by brute force in numpy; 100k vectors take milliseconds.
 - **Transcribe (GPU, faster-whisper large-v3-turbo, 8-bit).** Runs on the speech regions, with word timestamps. Segments whose confidence suggests invented text (high no-speech probability, very low average log-probability) are dropped.
-- **Clip.** Each kept candidate is cut with 50 ms of padding and short fades, and written to `samples-new/<kind>/<label>_<yyyymmdd>_<id>.flac` on the SSD. FLAC avoids a second round of lossy encoding. The label comes from the tagger, e.g. `glass_20261117_a3f9.flac`; `untagged_…` is used when the tagger isn't confident.
+- **Clip.** Each kept candidate is cut sample-exactly (start already includes a few ms of pre-roll), with a 3 ms fade-in and 15 ms fade-out, and written as 24-bit FLAC to `samples-new/<kind>/<label>_<yyyymmdd>_<event id>.flac` on the SSD. FLAC avoids a second round of lossy encoding. A clip whose decoded source overshoots full scale is turned down just enough to fit instead of clipping. Until tagging (milestone D) the label is the note for tonal clips (`E4`), the tempo for loops (`120bpm`), and `hit` or `texture` otherwise.
 
-**Chunk boundaries.** Each chunk is analyzed with the last 10 s of the previous chunk prepended, read from wherever that chunk now is (SSD, `unanalyzed/` or archive). Events that start inside that context are owned by the previous chunk, so nothing is counted twice. Speech that runs across a boundary gets transcribed whole.
+**Chunk boundaries.** Each chunk is analyzed with the last 15 s of the previous chunk prepended, read from wherever that chunk now is (SSD, `unanalyzed/` or archive). An event belongs to the chunk it starts in, except that events starting in a chunk's last 10 s belong to the next chunk, which sees them whole thanks to its context. Every event is therefore found once and never truncated. Chunks are decoded in full rather than seeked into, because libsndfile's Ogg seeking lands ~192 samples late within a file's last half second. Speech that runs across a boundary gets transcribed whole.
 
 ## Processing order
 
@@ -139,8 +144,8 @@ Each milestone is useful on its own:
 
 | Milestone | Delivers | Needs GPU |
 |---|---|---|
-| A | nightly timer, migration to HDD, archive and samples pruning, chunk state DB | no |
-| B | tonal / percussive / loop / texture detection, clip cutting, `list` | no |
+| A (built) | nightly timer, migration to HDD, archive and samples pruning, chunk state DB | no |
+| B (built) | tonal / percussive / loop / texture detection, clip cutting, `list`, `cut`, `reanalyze` | no |
 | C | review web app: proposed/kept pages, click-through player, widen, ratings, Tuning page | no |
 | D | AudioSet tags in clip names, CLAP search (CLI and web) | yes |
 | E | VAD + Whisper transcripts, transcript search (CLI and web) | yes |

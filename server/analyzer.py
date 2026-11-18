@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Nightly housekeeping and (later) analysis of recorded chunks.
+"""Nightly analysis and housekeeping of recorded chunks.
 
-    python3 analyzer.py run    [--config FILE] [--dry-run]
-    python3 analyzer.py status [--config FILE]
+    analyzer.py run        [--dry-run]           the nightly run (what the timer calls)
+    analyzer.py status                            chunk states, proposals, folder sizes
+    analyzer.py list       [--kind K] [--since 7d] [--all] [--limit N]
+    analyzer.py cut        EVENT_ID [--pad 0.5] [--out DIR]
+    analyzer.py reanalyze  [--session PREFIX] [--since 7d]
+    (all take --config FILE)
 
-Milestone A: finds unanalyzed chunks on the SSD working folder and in the HDD
-'unanalyzed' folder, runs the analysis stages on them (none yet), archives them,
-keeps the archive under its size cap, moves staged clips into the samples library
-and keeps that under its own cap. See docs/analyzer-plan.md.
+Each run finds unanalyzed chunks on the SSD working folder and in the HDD
+'unanalyzed' folder, detects sample-worthy moments (percussive, tonal, loop,
+texture), archives the chunks, cuts the best moments of each hour into clips
+on the SSD, moves the previous night's clips to the HDD library, and keeps the
+archive and library under their size caps. See docs/analyzer-plan.md.
 
-Standard library only (Python 3.11+). The config file is TOML, see
-analyzer.example.toml. Refuses to run unless <hdd_root>/.bug-yourself-archive exists.
+Housekeeping is standard library only (Python 3.11+). Detection needs numpy,
+scipy and soundfile (server/requirements.txt); without them chunks wait in
+'unanalyzed' instead of being archived. Refuses to run unless
+<hdd_root>/.bug-yourself-archive exists.
 """
 import argparse
 import contextlib
@@ -31,7 +38,8 @@ from receiver import (  # noqa: E402  (shared helpers)
 MARKER = ".bug-yourself-archive"
 MAX_ATTEMPTS = 3
 DEFAULT_CONFIG = Path.home() / ".config" / "bug-yourself" / "analyzer.toml"
-AUDIO_EXT = {".flac", ".wav", ".ogg", ".mp3", ".aif", ".aiff"}
+DEFAULT_QUOTA = {"percussive": 6, "tonal": 4, "loop": 2, "texture": 2}  # clips per hour
+DEFAULT_MIN_SCORE = {"percussive": 0.75, "tonal": 0.6, "loop": 0.6, "texture": 0.6}
 
 
 def log(msg):
@@ -47,6 +55,8 @@ class Config:
     samples_new_dir: Path  # SSD: tonight's clips
     archive_max: int
     samples_max: int
+    quota: dict           # clips per hour, per kind
+    min_score: dict       # minimum score to become a clip, per kind
 
     @property
     def unanalyzed_dir(self): return self.hdd_root / "unanalyzed"
@@ -70,6 +80,8 @@ def load_config(path):
             samples_new_dir=Path(raw["samples_new_dir"]).expanduser(),
             archive_max=parse_size(raw.get("archive_max", "500GB")),
             samples_max=parse_size(raw.get("samples_max", "100GB")),
+            quota={**DEFAULT_QUOTA, **raw.get("detect", {}).get("quota_per_hour", {})},
+            min_score={**DEFAULT_MIN_SCORE, **raw.get("detect", {}).get("min_score", {})},
         )
     except KeyError as e:
         sys.exit(f"config is missing {e}")
@@ -95,9 +107,29 @@ CREATE TABLE IF NOT EXISTS clips (
     path     TEXT UNIQUE NOT NULL,      -- current location
     cut_at   REAL NOT NULL,             -- "oldest" for pruning means oldest cut
     state    TEXT NOT NULL,             -- new | library | clip_removed | clip_pruned
-    event_id INTEGER                    -- filled in once detection exists (milestone B)
+    event_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS events (
+    id             INTEGER PRIMARY KEY,
+    session        TEXT NOT NULL,
+    chunk          TEXT NOT NULL,       -- the chunk that owns it (where it starts)
+    start_sample   INTEGER NOT NULL,    -- position in the session, so clips can be re-cut
+    end_sample     INTEGER NOT NULL,
+    sr             INTEGER NOT NULL,
+    at_time        REAL NOT NULL,       -- wall-clock time of start_sample (epoch seconds)
+    kind           TEXT NOT NULL,       -- percussive | tonal | loop | texture
+    score          REAL NOT NULL,
+    label          TEXT NOT NULL,
+    features       TEXT NOT NULL,       -- JSON: what the score was built from
+    status         TEXT NOT NULL,       -- candidate | proposed
+    detect_version INTEGER NOT NULL,
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_by_chunk ON events(chunk);
+CREATE INDEX IF NOT EXISTS events_by_time ON events(at_time);
 """
+# Columns added after milestone A; existing databases get them on open.
+CHUNK_COLUMNS = {"start_sample": "INTEGER", "frames": "INTEGER", "sr": "INTEGER", "detect_version": "INTEGER"}
 
 
 def open_db(path, dry=False):
@@ -112,18 +144,32 @@ def open_db(path, dry=False):
         db = sqlite3.connect(path)
         db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    have = {row[1] for row in db.execute("PRAGMA table_info(chunks)")}
+    for col, typ in CHUNK_COLUMNS.items():
+        if col not in have:
+            db.execute(f"ALTER TABLE chunks ADD COLUMN {col} {typ}")
     return db
 
 
+def load_sampling():
+    """The detection modules, or None (with the reason) if numpy & co. aren't installed."""
+    try:
+        import sampling
+        return sampling, None
+    except ImportError as e:
+        return None, str(e)
+
+
 # --- analysis stages ----------------------------------------------------------
-# Each stage takes (db, chunk_path) and raises on failure. Milestone A has none;
-# detection, tagging and transcription plug in here later.
+# Each stage takes (db, chunk_path) and raises on failure. Detection runs first
+# (added per run, since it needs to find neighbouring chunks); tagging and
+# transcription plug in here later.
 STAGES = []
 
 
-def analyze(db, name, path):
+def analyze(db, name, path, stages):
     try:
-        for stage in STAGES:
+        for stage in stages:
             stage(db, path)
     except Exception as e:  # one bad chunk must not stop the night's run
         attempts = db.execute("SELECT attempts FROM chunks WHERE name=?", (name,)).fetchone()[0] + 1
@@ -148,6 +194,14 @@ def total_size(files):
 class Run:
     def __init__(self, cfg, db, dry):
         self.cfg, self.db, self.dry = cfg, db, dry
+        self.started = time.time()
+        self.sampling, why = load_sampling()
+        if self.sampling is None:
+            log(f"WARNING: detection unavailable ({why}). Chunks stay in 'unanalyzed' until it's "
+                f"installed (server/install.sh does this).")
+        stages = [lambda db, path: self.sampling.detect_chunk(db, self.locate_any, path.name, path)] \
+            if self.sampling else []
+        self.stages = stages + STAGES
         # Dry run: files that a real run would have added, so the pruning forecast is right.
         self.would_archive = []  # (name, size)
         self.would_add_samples = []  # (sort key, size)
@@ -172,34 +226,49 @@ class Run:
                 (name, m["session"], int(m["seq"]), "pending", where, now))
         return found
 
-    def locate(self, name):
+    def locate(self, name, archive=False):
         """Chunks can move from the SSD to unanalyzed/ (receiver, 00:05) mid-run: look again."""
         session = NAME_RE.match(name)["session"]
-        for root in (self.cfg.unanalyzed_dir, self.cfg.working_dir):
+        roots = (self.cfg.unanalyzed_dir, self.cfg.working_dir) + ((self.cfg.archive_dir,) if archive else ())
+        for root in roots:
             p = root / session / name
             if p.exists():
                 return p
         return None
 
+    def locate_any(self, name):
+        return self.locate(name, archive=True)
+
     def process_chunks(self):
         found = self.discover()
         rows = self.db.execute(
             "SELECT name, state FROM chunks WHERE location IN ('working','unanalyzed') ORDER BY name").fetchall()
-        archived = analyzed = 0
+        archived = analyzed = waiting = 0
         for name, state in rows:
             if name not in found:
                 continue  # registered earlier but gone; nothing to do
+            if state == "pending" and self.sampling is None and not self.dry:
+                waiting += 1  # keep it unanalyzed rather than archive it without detection
+                continue
             if state == "pending":
                 path = self.locate(name)
                 if path and not self.dry:
-                    analyze(self.db, name, path)
+                    analyze(self.db, name, path, self.stages)
                     self.db.commit()
                 analyzed += 1
             state = self.db.execute("SELECT state FROM chunks WHERE name=?", (name,)).fetchone()[0]
             if state != "pending" or self.dry:
                 if self.archive(name):
                     archived += 1
-        self.say(f"chunks: {analyzed} processed, {archived} archived")
+        self.say(f"chunks: {analyzed} processed, {archived} archived"
+                 + (f", {waiting} waiting for detection to be installed" if waiting else ""))
+
+    def cut_clips(self):
+        if self.dry or self.sampling is None:
+            return
+        cut, failed = self.sampling.select_and_cut(
+            self.db, self.locate_any, self.cfg.samples_new_dir, self.cfg.quota, self.cfg.min_score, self.started)
+        self.say(f"clips: cut {cut} new clip(s)" + (f", {failed} failed" if failed else ""))
         if not self.dry:
             remove_empty_dirs(self.cfg.unanalyzed_dir)
 
@@ -352,6 +421,7 @@ def cmd_run(cfg, args):
         run.reconcile_clips()
         run.move_new_samples()
         run.process_chunks()
+        run.cut_clips()  # before pruning, so tonight's source audio is still there
         run.prune_archive()
         run.prune_samples()
         if args.dry_run:
@@ -378,9 +448,110 @@ def cmd_status(cfg, args):
                           ("samples", cfg.samples_dir, cfg.samples_max)):
         size = total_size(dir_files(d))
         log(f"{label:<18} {human(size):>9}" + (f" of {human(cap)}" if cap else ""))
+    rows = db.execute("SELECT kind, status, count(*) FROM events GROUP BY 1, 2 ORDER BY 1, 2").fetchall()
+    if rows:
+        log("detected moments (candidate = found, proposed = cut into a clip):")
+        for kind, status, n in rows:
+            log(f"  {kind:<11} {status:<10} {n}")
+    if load_sampling()[0] is None:
+        log(f"WARNING: detection unavailable: {load_sampling()[1]}")
+
+
+def parse_age(s):
+    """'7d', '12h', '30m' -> seconds."""
+    units = {"d": 86400, "h": 3600, "m": 60}
+    if not s or s[-1] not in units or not s[:-1].replace(".", "", 1).isdigit():
+        raise argparse.ArgumentTypeError("use e.g. 7d, 12h or 30m")
+    return float(s[:-1]) * units[s[-1]]
+
+
+def cmd_list(cfg, args):
+    check_hdd(cfg)
+    db = open_db(cfg.db_path)
+    where, params = ["1=1"], []
+    if not args.all:
+        where.append("e.status='proposed'")
+    if args.kind:
+        where.append("e.kind=?")
+        params.append(args.kind)
+    if args.since:
+        where.append("e.at_time >= ?")
+        params.append(time.time() - args.since)
+    rows = db.execute(
+        f"SELECT e.id, e.at_time, e.kind, e.label, e.score, (e.end_sample - e.start_sample) * 1.0 / e.sr, "
+        f"e.status, c.path, c.state FROM events e LEFT JOIN clips c ON c.event_id = e.id "
+        f"WHERE {' AND '.join(where)} ORDER BY {'e.score DESC' if args.best else 'e.at_time DESC'} LIMIT ?",
+        (*params, args.limit)).fetchall()
+    for ev_id, at, kind, label, score, dur, status, path, cstate in rows:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at))
+        where_ = path if cstate in ("new", "library") else (cstate or status)
+        log(f"{ev_id:>6}  {when}  {kind:<10} {label:<8} {score:4.2f}  {dur:5.1f}s  {where_}")
+    if not rows:
+        log("nothing matches")
+
+
+def cmd_cut(cfg, args):
+    check_hdd(cfg)
+    sampling, why = load_sampling()
+    if sampling is None:
+        sys.exit(f"detection modules unavailable: {why}")
+    db = open_db(cfg.db_path)
+    if not db.execute("SELECT 1 FROM events WHERE id=?", (args.event_id,)).fetchone():
+        sys.exit(f"no event {args.event_id} (see: analyzer.py list --all)")
+    run = Run(cfg, db, dry=True)  # only for its chunk lookup
+    try:
+        dest = sampling.cut_event(db, run.locate_any, args.event_id, Path(args.out).expanduser(),
+                                  pad_s=args.pad, suffix=f"_pad{args.pad:g}" if args.pad else "")
+    except (OSError, ValueError) as e:
+        sys.exit(f"can't cut event {args.event_id}: {e}")
+    log(str(dest))
+
+
+def cmd_reanalyze(cfg, args):
+    """Run detection on chunks that are already archived, e.g. after an upgrade."""
+    check_hdd(cfg)
+    with run_lock(cfg):
+        db = open_db(cfg.db_path)
+        run = Run(cfg, db, dry=False)
+        if run.sampling is None:
+            sys.exit("detection modules unavailable")
+        where, params = ["location='archive'"], []
+        if args.session:
+            where.append("session LIKE ?")
+            params.append(args.session + "%")
+        if args.since:
+            where.append("first_seen >= ?")
+            params.append(time.time() - args.since)
+        names = [r[0] for r in db.execute(
+            f"SELECT name FROM chunks WHERE {' AND '.join(where)} ORDER BY name", params)]
+        failed = 0
+        for i, name in enumerate(names, 1):
+            path = run.locate_any(name)
+            try:
+                run.sampling.detect_chunk(db, run.locate_any, name, path)
+                db.execute("UPDATE chunks SET state='analyzed', last_error=NULL WHERE name=?", (name,))
+            except Exception as e:  # keep going; report at the end
+                failed += 1
+                log(f"{name}: {e}")
+            db.commit()
+            if i % 100 == 0:
+                log(f"  {i}/{len(names)} chunks")
+        log(f"reanalyzed {len(names) - failed} chunk(s)" + (f", {failed} failed" if failed else ""))
+        run.cut_clips()
+        db.close()
+
+
+VENV_PYTHON = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "bug-yourself" / "venv" / "bin" / "python"
+
+
+def use_venv_if_needed():
+    """Typed `python3 analyzer.py ...` without numpy? Continue in the installer's venv."""
+    if load_sampling()[0] is None and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), *sys.argv])
 
 
 def main():
+    use_venv_if_needed()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.environ.get("BUG_ANALYZER_CONFIG", DEFAULT_CONFIG))
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -388,6 +559,22 @@ def main():
     r.add_argument("--dry-run", action="store_true", help="report what would move or be deleted, change nothing")
     r.set_defaults(fn=cmd_run)
     sub.add_parser("status", help="show chunk states and folder sizes").set_defaults(fn=cmd_status)
+    li = sub.add_parser("list", help="list proposed clips (or all detected moments)")
+    li.add_argument("--kind", choices=["percussive", "tonal", "loop", "texture"])
+    li.add_argument("--since", type=parse_age, help="e.g. 7d, 12h")
+    li.add_argument("--all", action="store_true", help="include candidates that weren't cut")
+    li.add_argument("--best", action="store_true", help="sort by score instead of time")
+    li.add_argument("--limit", type=int, default=30)
+    li.set_defaults(fn=cmd_list)
+    c = sub.add_parser("cut", help="cut (or re-cut) a clip for a detected moment")
+    c.add_argument("event_id", type=int)
+    c.add_argument("--pad", type=float, default=0.0, help="extra seconds of audio on each side")
+    c.add_argument("--out", default=".", help="folder for the clip (default: current folder)")
+    c.set_defaults(fn=cmd_cut)
+    ra = sub.add_parser("reanalyze", help="run detection again on archived chunks")
+    ra.add_argument("--session", help="only sessions starting with this, e.g. 20261117")
+    ra.add_argument("--since", type=parse_age, help="only chunks archived within, e.g. 7d")
+    ra.set_defaults(fn=cmd_reanalyze)
     args = ap.parse_args()
     args.fn(load_config(args.config), args)
 

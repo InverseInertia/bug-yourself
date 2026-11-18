@@ -17,6 +17,7 @@ ANALYZER_TOML=$CFG/analyzer.toml
 INSTALL_CONF=$CFG/install.conf
 UNITS=(bug-receiver.service bug-analyzer.service bug-analyzer.timer)
 MARKER=.bug-yourself-archive
+VENV=${XDG_DATA_HOME:-$HOME/.local/share}/bug-yourself/venv
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -141,7 +142,6 @@ configure() {
             RECEIVER_PYTHON=$(command -v python3)
         fi
     fi
-    ANALYZER_PYTHON=${ANALYZER_PYTHON:-$(command -v python3)}
 
     mkdir -p "$CFG" "$BUG_DIR" "$SAMPLES_NEW"
     umask 077  # the env file holds the token
@@ -165,11 +165,12 @@ hdd_root = "$HDD_ROOT"
 samples_new_dir = "$SAMPLES_NEW"
 archive_max = "$ARCHIVE_MAX"
 samples_max = "$SAMPLES_MAX"
+$(sed -n '/^\[detect\]/,$p' "$REPO/server/analyzer.example.toml")
 EOF
     cat > "$INSTALL_CONF" <<EOF
-# How the services start Python. Written by server/install.sh.
+# How the receiver starts Python. Written by server/install.sh.
+# (The analyzer always uses its own environment: $VENV)
 RECEIVER_PYTHON=$(quote "$RECEIVER_PYTHON")
-ANALYZER_PYTHON=$(quote "$ANALYZER_PYTHON")
 EOF
     prepare_hdd
 }
@@ -197,6 +198,26 @@ existing_parent() {
     printf '%s' "$p"
 }
 
+# --- analyzer environment -------------------------------------------------------
+
+setup_venv() {
+    # The analyzer's detection needs numpy, scipy and soundfile. They go in a private
+    # virtualenv, refreshed on every install so new requirements arrive with --update.
+    say ""
+    say "== Analyzer environment ($VENV)"
+    if [[ ! -x $VENV/bin/python ]]; then
+        mkdir -p "$(dirname "$VENV")"
+        python3 -m venv "$VENV" || { warn "couldn't create the virtualenv"; return 1; }
+    fi
+    if "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
+            -r "$REPO/server/requirements.txt"; then
+        say "  numpy, scipy, soundfile: ok"
+    else
+        warn "installing the analyzer's requirements failed; detection waits until this works"
+        return 1
+    fi
+}
+
 # --- services -----------------------------------------------------------------
 
 render() {  # render <template> <python command> <dest>
@@ -215,6 +236,12 @@ render() {  # render <template> <python command> <dest>
 install_services() {
     # shellcheck disable=SC1090
     . "$INSTALL_CONF"
+    # Without the venv the analyzer still archives and prunes; chunks just wait for detection.
+    if setup_venv; then
+        ANALYZER_PYTHON=$VENV/bin/python
+    else
+        ANALYZER_PYTHON=$(command -v python3)
+    fi
     mkdir -p "$UNIT_DIR"
     say ""
     say "== Installing services from $REPO"
