@@ -524,7 +524,7 @@ def cmd_reanalyze(cfg, args):
             params.append(time.time() - args.since)
         names = [r[0] for r in db.execute(
             f"SELECT name FROM chunks WHERE {' AND '.join(where)} ORDER BY name", params)]
-        waiting = db.execute("SELECT count(*) FROM chunks WHERE location IN ('working','unanalyzed')").fetchone()[0]
+        waiting = sum(len(chunk_files(d)) for d in (cfg.working_dir, cfg.unanalyzed_dir) if d.is_dir())
         if not names:
             log("no archived chunks match" + (
                 f"; {waiting} chunk(s) haven't had their first analysis yet: "
