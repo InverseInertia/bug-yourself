@@ -1,14 +1,14 @@
-# Copy to ~/.config/systemd/user/ and fill in the <...> values.
+# Template: server/install.sh fills in @REPO@ and @PYTHON@ and installs it to
+# ~/.config/systemd/user/. Your settings live in ~/.config/bug-yourself/receiver.env.
 [Unit]
 Description=bug-yourself receiver (uploads from the phone)
 
 [Service]
-# BUG_TOKEN=<secret> goes in this file so it isn't visible in the process list.
-EnvironmentFile=-%h/.config/bug-yourself/receiver.env
-ExecStart=/usr/bin/python3 %h/bug-yourself/server/receiver.py serve \
-    --bind <tailscale-ip> \
-    --dir %h/bug-yourself/recordings \
-    --unanalyzed-dir <hdd_root>/unanalyzed
+EnvironmentFile=%h/.config/bug-yourself/receiver.env
+ExecStart=@PYTHON@ @REPO@/server/receiver.py serve \
+    --bind ${BUG_BIND} --port ${BUG_PORT} \
+    --dir ${BUG_DIR} --unanalyzed-dir ${BUG_UNANALYZED_DIR} \
+    $BUG_EXTRA_ARGS
 # Binding to the Tailscale IP fails until Tailscale is up after boot; just retry.
 Restart=always
 RestartSec=15

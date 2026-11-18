@@ -1,4 +1,4 @@
-# Copy to ~/.config/systemd/user/ and enable with: systemctl --user enable --now bug-analyzer.timer
+# Installed by server/install.sh.
 [Unit]
 Description=Run the bug-yourself analyzer every night at midnight
 

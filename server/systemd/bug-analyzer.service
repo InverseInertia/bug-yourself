@@ -1,10 +1,11 @@
-# Copy to ~/.config/systemd/user/ (started by bug-analyzer.timer).
+# Template: server/install.sh fills in @REPO@ and @PYTHON@ and installs it to
+# ~/.config/systemd/user/. Settings live in ~/.config/bug-yourself/analyzer.toml.
 [Unit]
 Description=bug-yourself nightly analyzer
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/bug-yourself/server/analyzer.py run
+ExecStart=@PYTHON@ @REPO@/server/analyzer.py run
 # Stay out of the way of games and anything else running at night.
 Nice=10
 IOSchedulingClass=idle

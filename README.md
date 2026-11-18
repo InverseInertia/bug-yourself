@@ -65,20 +65,24 @@ A chunk whose analysis fails is retried on the next two nights, then archived an
 
 ### Running both as services
 
-`server/systemd/` has user units for the receiver (always on, retries until Tailscale is up) and the analyzer (a midnight timer that catches up after the PC was off). They assume the repo is cloned to `~/bug-yourself`; fill in the `<...>` values in `bug-receiver.service`, put `BUG_TOKEN=<secret>` in `~/.config/bug-yourself/receiver.env`, and copy the three files to `~/.config/systemd/user/`.
+`server/install.sh` sets up the receiver (always on) and the analyzer (midnight timer) as systemd user services. The first time, it asks a few questions:
+- the Tailscale IP (detected automatically)
+- the SSD and HDD folders
+- the size caps
+- the upload token (it can generate one)
+
+Your answers go to `~/.config/bug-yourself/`, and the installer creates the HDD marker once you confirm the folder really is on the HDD. At the end it prints the URL and token to enter on the phone.
 
 ```bash
-systemctl --user daemon-reload
+server/install.sh
 ```
+
+To update after new code lands in the repo, run it with `--update`. That pulls, regenerates the service files, and restarts the receiver; your settings aren't touched.
 
 ```bash
-systemctl --user enable --now bug-receiver.service bug-analyzer.timer
+server/install.sh --update
 ```
 
-```bash
-loginctl enable-linger $USER
-```
+`--reconfigure` asks the questions again, with your current values as defaults. `--uninstall` removes the services and leaves settings and recordings in place. You can also edit `~/.config/bug-yourself/receiver.env` or `analyzer.toml` by hand and re-run the installer.
 
-The last command lets them run after boot without anyone logging in. Logs: `journalctl --user -u bug-receiver -u bug-analyzer`.
-
-The receiver needs `ffmpeg` with libvorbis (or `oggenc`) on the host. If Bazzite's host doesn't have it, point `ExecStart` at `distrobox enter <box> -- python3 ...` instead.
+The installer also enables lingering, so the services run after boot without anyone logging in. If the host has no Vorbis encoder (`ffmpeg` with libvorbis, or `oggenc`), it offers to run the receiver inside a distrobox instead. Logs: `journalctl --user -u bug-receiver -u bug-analyzer`.
