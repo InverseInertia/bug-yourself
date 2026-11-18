@@ -5,11 +5,13 @@
                               [--token SECRET] [--quality 10] [--max-size 10GB]
                               [--when-full reject|prune] [--unanalyzed-dir HDD/unanalyzed]
                               [--offload-at 00:05]
-    python3 receiver.py join recordings/<session> [archive/<session> ...] out.wav
+    python3 receiver.py join <folders or chunk files...> out.wav [--from STAMP] [--to STAMP]
 
 Needs `oggenc`/`oggdec` (vorbis-tools) or `ffmpeg` built with libvorbis.
-Chunks land in <dir>/<session>/<session>_<seq>.ogg. <dir> is a working folder:
-the analyzer moves chunks out of it to the long-term archive every night.
+Chunks are named after the UTC time they start (see names.py) and land in
+<dir>/<YYYYMMDD>/<YYYYMMDDTHHMMSSZ>.ogg. <dir> is a working folder: the analyzer
+moves chunks out of it to the long-term archive every night. Uploads with the old
+<session>_<seq> names are renamed to their start time on arrival.
 
 When the folder reaches --max-size, the default (--when-full reject) is to refuse
 new uploads with 507; the phone keeps its files and retries, so nothing is lost
@@ -26,6 +28,7 @@ import contextlib
 import fcntl
 import hashlib
 import hmac
+import json
 import os
 import re
 import shutil
@@ -39,7 +42,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
 from pathlib import Path
 
-NAME_RE = re.compile(r"^(?P<session>[0-9A-Za-z-]+)_(?P<seq>\d+)\.(?P<ext>wav|flac|ogg)$")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from names import (  # noqa: E402
+    LEGACY_RE, NAME_RE, chunk_epoch, continuous, day_folder, epoch_stamp, legacy_session_epoch, ogg_info,
+)
+
+LEGACY_TABLE = ".legacy-names.json"
 CHUNK = 1 << 16
 UNITS = {"": 1, "B": 1, "K": 1 << 10, "KB": 1 << 10, "M": 1 << 20, "MB": 1 << 20,
          "G": 1 << 30, "GB": 1 << 30, "T": 1 << 40, "TB": 1 << 40}
@@ -134,7 +142,7 @@ def prune(root, max_bytes):
             if p.is_file():
                 size = p.stat().st_size
                 total += size
-                if NAME_RE.match(p.name):
+                if is_any_chunk(p.name):
                     chunks.append((p.name, p, size))
         chunks.sort()
         # Never delete the newest chunk, even if it alone is over the limit.
@@ -145,7 +153,7 @@ def prune(root, max_bytes):
             total -= size
             print(f"pruned {p.name} (folder over limit)", flush=True)
             try:
-                p.parent.rmdir()  # only succeeds once the session folder is empty
+                p.parent.rmdir()  # only succeeds once the day folder is empty
             except OSError:
                 pass
 
@@ -199,8 +207,8 @@ def move_verified(src, dst):
 
 
 def remove_empty_dirs(root, keep_newest=False):
-    """Remove empty session folders. keep_newest spares the folder the phone may still be filling."""
-    dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    """Remove empty day folders. keep_newest spares the folder uploads may still be landing in."""
+    dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.name.startswith("."))
     for d in dirs[:-1] if keep_newest else dirs:
         try:
             d.rmdir()
@@ -208,9 +216,48 @@ def remove_empty_dirs(root, keep_newest=False):
             pass
 
 
+def is_any_chunk(name):
+    return bool(NAME_RE.match(name) or LEGACY_RE.match(name))
+
+
 def chunk_files(root):
-    """Finished chunks under root (never *.part.*), oldest first."""
-    return sorted((p for p in root.rglob("*.ogg") if NAME_RE.match(p.name)), key=lambda p: p.name)
+    """Finished chunks under root (never *.part.*), oldest first. Includes old-style
+    names, which the analyzer renames on its next run."""
+    return sorted((p for p in root.rglob("*.ogg") if is_any_chunk(p.name)), key=lambda p: p.name)
+
+
+# --- old-style names ------------------------------------------------------------
+# A <session>_<seq> chunk starts where chunk seq-1 of that session ended. The table
+# remembers each converted chunk's exact start, so the next one continues exactly
+# even when it arrives later (from the phone's outbox, or after the analyzer has
+# renamed the ones already on disk). Callers hold move_lock(root).
+
+def load_legacy_table(root):
+    try:
+        return json.loads((root / LEGACY_TABLE).read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_legacy_table(root, table):
+    tmp = root / (LEGACY_TABLE + ".tmp")
+    tmp.write_text(json.dumps(table))
+    os.replace(tmp, root / LEGACY_TABLE)
+
+
+def legacy_assign(table, session, seq, frames, rate):
+    """New file name for chunk <session>_<seq>, which has `frames` samples at `rate`."""
+    entries = table.setdefault(session, {})
+    if str(seq) not in entries:
+        prev = entries.get(str(seq - 1))
+        if seq == 0:
+            start_ms = legacy_session_epoch(session) * 1000
+        elif prev:
+            start_ms = prev[0] + prev[1] * 1000 / prev[2]
+        else:  # exact for every chunk but a session's last, which is the only short one
+            start_ms = legacy_session_epoch(session) * 1000 + seq * frames * 1000 / rate
+        entries[str(seq)] = [start_ms, frames, rate]
+    return epoch_stamp(entries[str(seq)][0] / 1000) + ".ogg"
 
 
 def offload(root, dest):
@@ -228,7 +275,7 @@ def offload(root, dest):
                 continue  # the analyzer archived it first
             except (OSError, Conflict) as e:
                 print(f"offload of {src.name} failed: {e}", flush=True)
-        # The phone may still be uploading into the newest session folder. (Any other
+        # The phone may still be uploading into the newest day folder. (Any other
         # collision just fails one upload, which the phone retries.)
         remove_empty_dirs(root, keep_newest=True)
     print(f"offload: moved {moved} chunk(s) to {dest}", flush=True)
@@ -279,9 +326,10 @@ class Handler(BaseHTTPRequestHandler):
 
         prefix = "/upload/"
         name = self.path[len(prefix):] if self.path.startswith(prefix) else ""
-        m = NAME_RE.match(name)
+        m = NAME_RE.match(name) or LEGACY_RE.match(name)
         if not m or m["ext"] not in ("wav", "flac"):
             return self.reply(400, "bad name")
+        legacy = "session" in m.groupdict()
         try:
             length = int(self.headers["Content-Length"])
         except (TypeError, ValueError):
@@ -293,12 +341,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.log_message("working folder full, refusing %s", name)
                 return self.reply(507, "working folder full")
 
-        dest_dir = self.root / m["session"]
-        dest_dir.mkdir(parents=True, exist_ok=True)
         stem = name.rsplit(".", 1)[0]
-        dest = dest_dir / (stem + ".ogg")
-        in_part = dest_dir / f"{stem}.part.{m['ext']}"  # keep the real extension for the encoder
-        ogg_part = dest_dir / (stem + ".part.ogg")
+        incoming = self.root / ".incoming"
+        incoming.mkdir(parents=True, exist_ok=True)
+        in_part = incoming / f"{stem}.part.{m['ext']}"  # keep the real extension for the encoder
+        ogg_part = incoming / (stem + ".part.ogg")
+        # Old-style names only get their final name once the encoded length is known.
+        dest = None if legacy else self.root / day_folder(name) / (stem + ".ogg")
 
         h = hashlib.sha256()
         remaining = length
@@ -316,7 +365,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, "incomplete or corrupt upload")
 
         # A retry after a lost response: this chunk is already stored.
-        if dest.exists():
+        if dest is not None and dest.exists():
             in_part.unlink()
             return self.reply(200, "already have it")
 
@@ -324,6 +373,17 @@ class Handler(BaseHTTPRequestHandler):
             encode(in_part, ogg_part, self.quality)
             with open(ogg_part, "rb+") as f:
                 os.fsync(f.fileno())
+            if legacy:
+                frames, rate = ogg_info(ogg_part)
+                with move_lock(self.root):
+                    table = load_legacy_table(self.root)
+                    final = legacy_assign(table, m["session"], int(m["seq"]), frames, rate)
+                    save_legacy_table(self.root, table)
+                dest = self.root / day_folder(final) / final
+                if dest.exists():
+                    ogg_part.unlink()
+                    return self.reply(200, "already have it")
+            dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(ogg_part, dest)
         except Exception as e:
             ogg_part.unlink(missing_ok=True)
@@ -332,7 +392,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             in_part.unlink(missing_ok=True)
 
-        self.log_message("saved %s (%d -> %d bytes)", dest.name, length, dest.stat().st_size)
+        self.log_message("saved %s%s (%d -> %d bytes)", dest.name, f" (sent as {name})" if legacy else "",
+                         length, dest.stat().st_size)
         if self.when_full == "prune":
             prune(self.root, self.max_bytes)
         return self.reply(201, "saved")
@@ -365,35 +426,42 @@ def serve(args):
 
 # --- join -------------------------------------------------------------------
 
-def join(args):
-    check_codec()
-    # A session can be split between the working folder and the archive mid-migration.
-    found = {}
-    for src in map(Path, args.session_dirs):
-        for p in src.iterdir():
-            if (m := NAME_RE.match(p.name)):
-                found.setdefault(int(m["seq"]), p)
-    segs = sorted(found.items())
-    if not segs:
-        sys.exit(f"no segments in {', '.join(args.session_dirs)}")
+def chunk_sort_key(p):
+    if (m := NAME_RE.match(p.name)):
+        return (chunk_epoch(p.name), 0)
+    m = LEGACY_RE.match(p.name)
+    return (legacy_session_epoch(m["session"]), int(m["seq"]))
 
-    missing = sorted(set(range(segs[0][0], segs[-1][0] + 1)) - {s for s, _ in segs})
-    if missing:
-        print(f"WARNING: missing segments {missing}; output will have gaps there", file=sys.stderr)
-    if segs[0][0] != 0:
-        print(f"WARNING: first segment is {segs[0][0]}, not 0 (older chunks pruned?)", file=sys.stderr)
+
+def join(args):
+    """Join chunks in time order into one file, warning wherever the audio isn't continuous."""
+    check_codec()
+    found = {}
+    for src in map(Path, args.inputs):
+        for p in [src] if src.is_file() else sorted(src.rglob("*")):
+            if p.is_file() and is_any_chunk(p.name):
+                found.setdefault(p.name, p)  # the same chunk may be in two folders mid-move
+    segs = sorted(found.values(), key=chunk_sort_key)
+    if args.start:
+        segs = [p for p in segs if chunk_sort_key(p)[0] >= chunk_epoch(args.start + ".ogg")]
+    if args.end:
+        segs = [p for p in segs if chunk_sort_key(p)[0] <= chunk_epoch(args.end + ".ogg")]
+    if not segs:
+        sys.exit(f"no chunks found in {', '.join(args.inputs)}")
 
     out_path = Path(args.out)
     want_ogg = out_path.suffix.lower() == ".ogg"
+    gaps = 0
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         joined_wav = tmp / "joined.wav" if want_ogg else out_path
         params = None
+        prev = None  # (start epoch, seconds) of the previous new-style chunk
         with wave.open(str(joined_wav), "wb") as out:
-            for seq, p in segs:
+            for i, p in enumerate(segs):
                 pcm = p
                 if p.suffix != ".wav":
-                    pcm = tmp / f"{seq}.wav"
+                    pcm = tmp / f"{i}.wav"
                     decode(p, pcm)
                 with wave.open(str(pcm), "rb") as w:
                     if params is None:
@@ -401,12 +469,19 @@ def join(args):
                         out.setparams(params)
                     elif w.getparams()[:3] != params[:3]:
                         sys.exit(f"{p.name} has a different format")
+                    epoch = chunk_epoch(p.name)
+                    if prev and epoch is not None and not continuous(prev[0], prev[1], epoch):
+                        gap = epoch - prev[0] - prev[1]
+                        print(f"WARNING: {gap:+.0f} s gap before {p.name}; the output jumps there",
+                              file=sys.stderr)
+                        gaps += 1
+                    prev = (epoch, w.getnframes() / w.getframerate()) if epoch is not None else None
                     out.writeframes(w.readframes(w.getnframes()))
                 if pcm is not p:
                     pcm.unlink()
         if want_ogg:
             encode(joined_wav, out_path, args.quality)
-    print(f"joined {len(segs)} segments into {out_path}")
+    print(f"joined {len(segs)} chunks into {out_path}" + (f" ({gaps} gap(s))" if gaps else ""))
 
 
 def main():
@@ -426,8 +501,11 @@ def main():
     s.add_argument("--when-full", choices=["reject", "prune"], default="reject",
                    help="at the limit: refuse uploads so the phone holds them (default), or delete oldest chunks")
     s.set_defaults(fn=serve)
-    j = sub.add_parser("join", help="decode a session's chunks and join them into one file (.wav or .ogg)")
-    j.add_argument("session_dirs", nargs="+", metavar="session_dir")
+    j = sub.add_parser("join", help="decode chunks and join them in time order into one file (.wav or .ogg)")
+    j.add_argument("inputs", nargs="+", metavar="folder_or_chunk",
+                   help="day folders (recordings/20261117), whole folders, or chunk files")
+    j.add_argument("--from", dest="start", metavar="STAMP", help="first chunk, e.g. 20261117T201500Z")
+    j.add_argument("--to", dest="end", metavar="STAMP", help="last chunk")
     j.add_argument("out")
     j.add_argument("--quality", type=quality, default=quality(os.environ.get("BUG_QUALITY", 10)),
                    help="Vorbis quality if out is .ogg (default 10, or set BUG_QUALITY)")

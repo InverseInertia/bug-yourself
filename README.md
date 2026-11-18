@@ -4,7 +4,7 @@ A tiny Android app that records the mic continuously and ships the audio to a PC
 
 The phone records into fixed-length lossless FLAC segments (48 kHz, 16-bit, mono) and uploads each one when it's finished. The PC encodes each segment to Ogg Vorbis at quality 10 (well above transparency, leaving headroom for sample editing) and keeps the folder under a size cap. If the PC is unreachable, segments pile up on the phone and upload later. Recording never stops.
 
-**Seamless by design.** One `AudioRecord` stream runs for the whole session and is never restarted. It gets split into segments at exact sample counts, so joining a session's segments gives back the original stream with no gaps and no clicks. Reading the mic and encoding/writing happen on separate threads, so slow storage can't cause dropouts. The FLAC encoder is a small built-in one (`FlacEncoder.kt`), so its output is the same on every phone. The app uses the `UNPROCESSED` mic source (no AGC or noise suppression) when the phone supports it.
+**Seamless by design.** One `AudioRecord` stream runs for the whole recording and is never restarted. It gets split into segments at exact sample counts, so joining a recording's segments gives back the original stream with no gaps and no clicks. Each segment is named after the UTC time of its first sample, e.g. `20261117T201500Z.flac`. The time is computed from the recording's start plus the samples before it, so a clock adjustment mid-recording can't skew the names. Reading the mic and encoding/writing happen on separate threads, so slow storage can't cause dropouts. The FLAC encoder is a small built-in one (`FlacEncoder.kt`), so its output is the same on every phone. The app uses the `UNPROCESSED` mic source (no AGC or noise suppression) when the phone supports it.
 
 ## PC side
 
@@ -14,20 +14,20 @@ You need Python 3, plus either `vorbis-tools` (`oggenc`/`oggdec`) or `ffmpeg` bu
 python3 server/receiver.py serve --bind <your-pc-tailscale-ip> --token <pick-a-secret>
 ```
 
-The default port is 8675. Chunks land in `recordings/<session>/<session>_<seq>.ogg` (session = UTC start time).
+The default port is 8675. Chunks land in day folders, `recordings/20261117/20261117T201500Z.ogg`, named after their UTC start time. UTC avoids the repeated hour when daylight saving ends. Uploads using the old `<session>_<seq>` names (from older app builds, or still in the phone's outbox) are renamed to their start time on arrival.
 
 - `--quality` sets the Vorbis quality, -1 to 10 (default 10, about 250 kbps on dense material). You can also set it with the `BUG_QUALITY` environment variable. It applies to chunks that arrive after you change it.
 - `--max-size` caps the working folder (default `10GB`, `0` for no limit). When it's full, the receiver refuses uploads with 507 and the phone keeps its files and retries, so nothing is lost. `--when-full prune` deletes the oldest chunks instead. The working folder is meant to live on the SSD; the analyzer moves each night's audio to the HDD archive (see [docs/analyzer-plan.md](docs/analyzer-plan.md)).
 
 - `--unanalyzed-dir` moves every finished chunk off the working folder to a second folder, e.g. `unanalyzed/` on the HDD. It runs daily at `--offload-at` (default `00:05`, local time) and once at startup, and verifies each copy before deleting the original. This keeps the SSD to about a day of audio even if the analyzer isn't running. The folder must already exist; if it's missing (drive not mounted), nothing moves and the problem is logged.
 
-To stitch a session into one file (list both folders if part of it has already moved to the archive):
+To stitch chunks into one file, give `join` folders or chunk files (from the working folder, `unanalyzed/` and the archive alike). It puts them in time order, and `--from`/`--to` pick out a stretch by chunk name:
 
 ```bash
-python3 server/receiver.py join recordings/20261117-193000 session.wav
+python3 server/receiver.py join archive/20261117 --from 20261117T193000Z --to 20261117T203000Z out.wav
 ```
 
-`join` decodes every chunk and joins them at the sample level. The output has the exact original sample count, and quality at the joins matches the rest of the audio. Name the output `.ogg` instead of `.wav` to re-encode it, at the cost of one more round of lossy encoding.
+`join` decodes every chunk and joins them at the sample level. Wherever one chunk doesn't continue the previous one (you stopped and started recording), it warns that the output jumps there. The output has the exact original sample count, and quality at the joins matches the rest of the audio. Name the output `.ogg` instead of `.wav` to re-encode it, at the cost of one more round of lossy encoding.
 
 Uploads (FLAC, or WAV from older app builds) carry a SHA-256 and are verified before encoding. The `.ogg` is written to a `.part` file first and renamed into place, and the phone only deletes its copy after that. Retries are idempotent.
 

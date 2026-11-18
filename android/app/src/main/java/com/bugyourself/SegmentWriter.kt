@@ -4,6 +4,9 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 
 /**
  * Splits one continuous PCM stream into FLAC files of exactly [segmentFrames] frames.
@@ -12,17 +15,22 @@ import java.io.RandomAccessFile
  * decoding segments 0..N and concatenating them reproduces the original stream
  * sample-for-sample. Pure JVM code: no Android imports.
  *
+ * Each file is named after the UTC time of its first sample (20261117T201500Z.flac),
+ * computed from [startMillis] plus the samples before it rather than read from the
+ * clock, so a clock adjustment mid-recording can't skew the names.
+ *
  * Files are written into [workDir] and moved into [outbox] once complete.
  */
 class SegmentWriter(
     private val workDir: File,
     private val outbox: File,
-    private val session: String,
+    private val startMillis: Long,
     private val sampleRate: Int,
     private val channels: Int,
     segmentFrames: Long,
     private val onSegmentDone: (File) -> Unit = {},
 ) {
+    private val segmentFrames = segmentFrames
     private val segmentBytes = segmentFrames * channels * 2
 
     private var seq = 0
@@ -54,7 +62,7 @@ class SegmentWriter(
     }
 
     private fun open() {
-        val f = File(workDir, "%s_%05d.flac".format(session, seq++))
+        val f = File(workDir, chunkName(startMillis + seq++ * segmentFrames * 1000 / sampleRate))
         val s = BufferedOutputStream(FileOutputStream(f), 1 shl 16)
         current = f
         stream = s
@@ -80,6 +88,11 @@ class SegmentWriter(
     }
 
     companion object {
+        private val STAMP = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC)
+
+        /** UTC start time to the second: chunks are at least 6 s long, so names never collide. */
+        fun chunkName(millis: Long): String = STAMP.format(Instant.ofEpochMilli(millis)) + ".flac"
+
         /**
          * A crash or force-stop leaves an in-progress segment whose last frame may be
          * cut off. Keep the intact frames and hand the file to the outbox.

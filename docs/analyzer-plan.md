@@ -9,8 +9,8 @@ The analyzer runs once a night. It finds points of interest for sampling in reco
 | Folder | Drive | Owner | Size policy |
 |---|---|---|---|
 | `recordings/` (working) | SSD | receiver writes; receiver moves out at 00:05 | ~1 day; 10 GB hard cap, receiver refuses uploads when full (phone holds them) |
-| `unanalyzed/<session>/` | HDD | receiver moves chunks in at 00:05; analyzer archives them out | grows only while the analyzer is down (~2.4 GB/day) |
-| `archive/<session>/` | HDD | analyzer | 500 GB; oldest chunks deleted first |
+| `unanalyzed/<YYYYMMDD>/` | HDD | receiver moves chunks in at 00:05; analyzer archives them out | grows only while the analyzer is down (~2.4 GB/day) |
+| `archive/<YYYYMMDD>/` | HDD | analyzer | 500 GB; oldest chunks deleted first |
 | `samples-new/` | SSD | analyzer writes tonight's clips | about one night of clips; moved to the HDD at the start of the next run |
 | `samples/` | HDD | analyzer | 100 GB; oldest clips deleted first |
 | `analyzer.db` (SQLite) | HDD, next to archive | analyzer | small (MBs per day) |
@@ -45,7 +45,7 @@ Each chunk is decoded once (Ogg → 48 kHz mono float) and then passes through t
   What milestone B detection doesn't do yet:
   - **Speech isn't excluded.** Voices will show up as tonal and percussive candidates until voice detection arrives with transcription (milestone E). The isolation and pitch-stability terms keep most speech below the clip cutoffs.
   - **Steady sounds lasting a whole chunk aren't tonal candidates.** Tonal detection measures against the chunk's own floor, so a fridge hum lasting the whole chunk isn't found. Steady broadband sound is caught as texture, because texture is measured against an absolute quiet reference (−60 dBFS).
-  - **The last 10 s of a session's final chunk are never owned**, because the next chunk normally owns them. Those 10 s are lost to detection if the session ends there.
+  - **The last 10 s of a recording's final chunk are never owned**, because the next chunk normally owns them. Those 10 s are lost to detection if the recording ends there.
 - **Voice detection (CPU, Silero VAD).** Speech regions feed transcription and are excluded from the tonal/texture candidates.
 - **Tag (GPU, PANNs or BEATs).** Candidate windows get AudioSet labels with confidences. The top label becomes part of the clip name.
 - **Embed (GPU, CLAP).** Every candidate gets a 512-dim embedding, plus one embedding per 10 s window of the whole day for open-ended search. Stored as blobs and searched by brute force in numpy; 100k vectors take milliseconds.
@@ -63,7 +63,7 @@ Rough cost for a full day of recording on the 3080: detection about 15–30 minu
 ## Migration and archive
 
 For each analyzed chunk, from whichever folder it's in, the analyzer:
-- copies it to `archive/<session>/<name>.part.ogg` and fsyncs it (from `unanalyzed/` this is a same-drive rename, so it's instant)
+- copies it to `archive/<YYYYMMDD>/<name>.part.ogg` and fsyncs it (from `unanalyzed/` this is a same-drive rename, so it's instant)
 - verifies the copy's size and SHA-256 against the source
 - renames it into place, then deletes the source copy
 
@@ -92,26 +92,28 @@ The library is a holding area. Clips worth keeping are moved out by hand, to a f
 
 Clips that vanish because you moved or deleted them are normal, not errors. At the start of each run the analyzer checks the clip paths it knows about, and marks missing ones `clip_removed` (distinct from `clip_pruned`, which it set itself). Their index entries stay searchable like pruned ones. Cleanup only counts and deletes files that are actually there.
 
-`receiver.py join` already accepts several folders, so a session spread over the SSD, `unanalyzed/` and the archive can still be joined.
+`receiver.py join` accepts any mix of folders and chunk files, so a recording spread over the SSD, `unanalyzed/` and the archive can still be joined.
 
 ## Data model (SQLite)
 
-- `chunks(session, seq, path, sha256, state, analyzed_at, migrated_at)`
-- `events(id, session, start_sample, end_sample, kind, score, label, label_conf, tags_json, clip_path)`
+- `chunks(name, session, seq, start_sample, frames, state, location, ...)`
+- `events(id, session, chunk, start_sample, end_sample, kind, score, label, features, status, ...)`
 - `embeddings(event_id or window_id, vector BLOB)`
 - `transcript(id, session, start_sample, end_sample, text, avg_logprob)` plus an FTS5 virtual table over `text`, with word timings in a side table
 
-Positions are stored as sample offsets within the session (`seq × segment length + offset`). Clips and transcripts can therefore always be traced back to the exact spot, and any window can be re-cut with different padding.
+**Chunk names and runs.** Chunks are named after the UTC time of their first sample (`20261117T201500Z.ogg`) and stored in UTC day folders. Nothing in a name says which recording a chunk belongs to. Instead, the analyzer links a chunk to the one before it (by time) when that one's start plus its length lands within a second of this chunk's start. Names are truncated to the second, so continuous chunks always land within that. Linked chunks form a *run*, which is what the `session` column holds; it's named after the run's first chunk. Positions are sample offsets within the run, so clips and transcripts can always be traced back to the exact spot, and any window can be re-cut with different padding.
+
+Older builds named chunks `<session>_<seq>`. Each run renames any such files on disk, and their DB rows, to their start time: chunk 0 starts at the session time, and each later chunk where the previous one ended. A table in the working folder (`.legacy-names.json`) records each conversion, so an old-style chunk that arrives later from the phone's outbox continues exactly where its predecessor left off. The receiver uses the same table when it renames old-style uploads. Clips and transcripts can therefore always be traced back to the exact spot, and any window can be re-cut with different padding.
 
 ## Interface
 
 A CLI first:
-- `analyzer.py run` (what the timer calls; `--dry-run`, `--session X`)
+- `analyzer.py run` (what the timer calls; `--dry-run`)
 - `search "metallic ring"` (CLAP text search over events and day windows)
 - `find-text "phrase"` (transcript search)
 - `list --kind percussive --since 7d`
 - `cut <event-id> --pad 200ms`
-- `reanalyze`
+- `reanalyze [--prefix 20261117]`
 
 Results print with clip paths, so they open straight in a sampler or DAW.
 

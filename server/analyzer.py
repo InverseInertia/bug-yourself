@@ -5,7 +5,7 @@
     analyzer.py status                            chunk states, proposals, folder sizes
     analyzer.py list       [--kind K] [--since 7d] [--all] [--limit N]
     analyzer.py cut        EVENT_ID [--pad 0.5] [--out DIR]
-    analyzer.py reanalyze  [--session PREFIX] [--since 7d]
+    analyzer.py reanalyze  [--prefix 20261117] [--since 7d]
     (all take --config FILE)
 
 Each run finds unanalyzed chunks on the SSD working folder and in the HDD
@@ -31,8 +31,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from names import LEGACY_RE, NAME_RE, day_folder, epoch_stamp, legacy_session_epoch, ogg_info  # noqa: E402
 from receiver import (  # noqa: E402  (shared helpers)
-    NAME_RE, Conflict, chunk_files, human, move_lock, move_verified, parse_size, remove_empty_dirs,
+    Conflict, chunk_files, human, is_any_chunk, legacy_assign, load_legacy_table, move_lock, move_verified,
+    parse_size, remove_empty_dirs, save_legacy_table,
 )
 
 MARKER = ".bug-yourself-archive"
@@ -91,9 +93,9 @@ def load_config(path):
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
-    name         TEXT PRIMARY KEY,      -- <session>_<seq>.ogg
-    session      TEXT NOT NULL,
-    seq          INTEGER NOT NULL,
+    name         TEXT PRIMARY KEY,      -- <UTC start>.ogg, e.g. 20261117T201500Z.ogg
+    session      TEXT NOT NULL,         -- run: continuous chunks, named after the first one
+    seq          INTEGER NOT NULL,      -- position within the run
     state        TEXT NOT NULL,         -- pending | analyzed | analysis_failed
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT,
@@ -111,9 +113,9 @@ CREATE TABLE IF NOT EXISTS clips (
 );
 CREATE TABLE IF NOT EXISTS events (
     id             INTEGER PRIMARY KEY,
-    session        TEXT NOT NULL,
+    session        TEXT NOT NULL,       -- the run it's in (see chunks.session)
     chunk          TEXT NOT NULL,       -- the chunk that owns it (where it starts)
-    start_sample   INTEGER NOT NULL,    -- position in the session, so clips can be re-cut
+    start_sample   INTEGER NOT NULL,    -- position in the run, so clips can be re-cut
     end_sample     INTEGER NOT NULL,
     sr             INTEGER NOT NULL,
     at_time        REAL NOT NULL,       -- wall-clock time of start_sample (epoch seconds)
@@ -216,22 +218,25 @@ class Run:
         found = {}
         for where, root in (("working", self.cfg.working_dir), ("unanalyzed", self.cfg.unanalyzed_dir)):
             for p in chunk_files(root) if root.is_dir() else []:
-                found.setdefault(p.name, (where, p))  # mid-move duplicates: either copy is fine
+                # Old-style names were renamed by migrate_names(); a dry run didn't rename
+                # them, but counts them so its forecast matches the real run.
+                if NAME_RE.match(p.name) or (self.dry and LEGACY_RE.match(p.name)):
+                    found.setdefault(p.name, (where, p))  # mid-move duplicates: either copy is fine
         now = time.time()
         for name, (where, _) in found.items():
-            m = NAME_RE.match(name)
+            # The run and position are settled when the chunk is analyzed.
             self.db.execute(
                 "INSERT INTO chunks(name, session, seq, state, location, first_seen) VALUES (?,?,?,?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET location=excluded.location",
-                (name, m["session"], int(m["seq"]), "pending", where, now))
+                (name, name[:-4], 0, "pending", where, now))
         return found
 
     def locate(self, name, archive=False):
         """Chunks can move from the SSD to unanalyzed/ (receiver, 00:05) mid-run: look again."""
-        session = NAME_RE.match(name)["session"]
         roots = (self.cfg.unanalyzed_dir, self.cfg.working_dir) + ((self.cfg.archive_dir,) if archive else ())
+        legacy = LEGACY_RE.match(name)
         for root in roots:
-            p = root / session / name
+            p = root / (legacy["session"] if legacy else day_folder(name)) / name
             if p.exists():
                 return p
         return None
@@ -273,8 +278,7 @@ class Run:
             remove_empty_dirs(self.cfg.unanalyzed_dir)
 
     def archive(self, name):
-        session = NAME_RE.match(name)["session"]
-        dst = self.cfg.archive_dir / session / name
+        dst = self.cfg.archive_dir / day_folder(name) / name
         if self.dry:
             src = self.locate(name)
             if src:
@@ -297,7 +301,7 @@ class Run:
         return True
 
     def prune_archive(self):
-        entries = [(p.name, p.stat().st_size, p) for p in dir_files(self.cfg.archive_dir) if NAME_RE.match(p.name)]
+        entries = [(p.name, p.stat().st_size, p) for p in dir_files(self.cfg.archive_dir) if is_any_chunk(p.name)]
         entries += [(n, size, None) for n, size in self.would_archive]
         entries.sort(key=lambda e: e[0])
         total = total_size(dir_files(self.cfg.archive_dir)) + sum(size for _, size in self.would_archive)
@@ -325,6 +329,61 @@ class Run:
                 p.unlink()
         if stale:
             self.say(f"removed {len(stale)} leftover partial file(s)")
+
+    def migrate_names(self):
+        """Rename chunks with old <session>_<seq> names to their start time, on disk and
+        in the DB. Runs at the start of every run; does nothing once all are converted."""
+        roots = (self.cfg.working_dir, self.cfg.unanalyzed_dir, self.cfg.archive_dir)
+        files = {}
+        for root in roots:
+            for p in (root.rglob("*.ogg") if root.is_dir() else []):
+                if LEGACY_RE.match(p.name):
+                    files.setdefault(p.name, []).append((root, p))
+        rows = {r[0]: r for r in self.db.execute("SELECT name, frames, sr FROM chunks") if LEGACY_RE.match(r[0])}
+        names = sorted(set(files) | set(rows), key=lambda n: (LEGACY_RE.match(n)["session"],
+                                                              int(LEGACY_RE.match(n)["seq"])))
+        if not names:
+            return
+        if self.dry:
+            self.say(f"would rename {len(names)} chunk(s) from the old naming scheme")
+            return
+        # Hold the receiver's lock: it converts old-style uploads with the same table.
+        with move_lock(self.cfg.working_dir) if self.cfg.working_dir.is_dir() else contextlib.nullcontext():
+            table = load_legacy_table(self.cfg.working_dir) if self.cfg.working_dir.is_dir() else {}
+            last = (2880000, 48000)  # length estimate for a pruned chunk nobody measured
+            for old in names:
+                m = LEGACY_RE.match(old)
+                session, seq = m["session"], int(m["seq"])
+                row = rows.get(old)
+                if row and row[1]:
+                    length = (row[1], row[2])
+                elif old in files:
+                    length = ogg_info(files[old][0][1])
+                else:
+                    length = last
+                last = length
+                new = legacy_assign(table, session, seq, *length)
+                for root, p in files.get(old, []):
+                    dst = root / day_folder(new) / new
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.exists():
+                        p.unlink()  # converted before (a re-upload, or an interrupted rename)
+                    else:
+                        os.replace(p, dst)
+                run = epoch_stamp(legacy_session_epoch(session))
+                if row:
+                    if self.db.execute("SELECT 1 FROM chunks WHERE name=?", (new,)).fetchone():
+                        self.db.execute("DELETE FROM chunks WHERE name=?", (old,))
+                    else:
+                        self.db.execute("UPDATE chunks SET name=?, session=? WHERE name=?", (new, run, old))
+                self.db.execute("UPDATE events SET chunk=?, session=? WHERE chunk=?", (new, run, old))
+            if self.cfg.working_dir.is_dir():
+                save_legacy_table(self.cfg.working_dir, table)
+            self.db.commit()
+        for root in roots:
+            if root.is_dir():
+                remove_empty_dirs(root, keep_newest=root == self.cfg.working_dir)
+        self.say(f"renamed {len(names)} chunk(s) from the old naming scheme to their start time")
 
     # samples -----------------------------------------------------------------
 
@@ -418,6 +477,7 @@ def cmd_run(cfg, args):
         run = Run(cfg, db, args.dry_run)
         # Last night's clips go to the HDD first, so tonight's land in an empty staging folder.
         run.clean_partials()
+        run.migrate_names()
         run.reconcile_clips()
         run.move_new_samples()
         run.process_chunks()
@@ -516,9 +576,10 @@ def cmd_reanalyze(cfg, args):
         if run.sampling is None:
             sys.exit("detection modules unavailable")
         where, params = ["location='archive'"], []
-        if args.session:
-            where.append("session LIKE ?")
-            params.append(args.session + "%")
+        run.migrate_names()
+        if args.prefix:
+            where.append("name LIKE ?")
+            params.append(args.prefix + "%")
         if args.since:
             where.append("first_seen >= ?")
             params.append(time.time() - args.since)
@@ -578,7 +639,8 @@ def main():
     c.add_argument("--out", default=".", help="folder for the clip (default: current folder)")
     c.set_defaults(fn=cmd_cut)
     ra = sub.add_parser("reanalyze", help="run detection again on archived chunks")
-    ra.add_argument("--session", help="only sessions starting with this, e.g. 20261117")
+    ra.add_argument("--prefix", help="only chunks whose name (UTC start) begins with this, "
+                                     "e.g. 20261117 for a day or 20261117T20 for an hour")
     ra.add_argument("--since", type=parse_age, help="only chunks archived within, e.g. 7d")
     ra.set_defaults(fn=cmd_reanalyze)
     args = ap.parse_args()

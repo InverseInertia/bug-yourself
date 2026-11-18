@@ -21,7 +21,6 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.LinkedBlockingQueue
 
 /**
@@ -87,10 +86,9 @@ class RecorderService : Service() {
 
             val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
             val segMinutes = prefs.getString("segMinutes", "5")!!.toDoubleOrNull()?.coerceAtLeast(0.1) ?: 5.0
-            val session = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
-                .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())
+            val startMillis = System.currentTimeMillis()
             val segWriter = SegmentWriter(
-                workDir(this), outbox(this), session, SAMPLE_RATE, CHANNELS,
+                workDir(this), outbox(this), startMillis, SAMPLE_RATE, CHANNELS,
                 (segMinutes * 60 * SAMPLE_RATE).toLong(),
             ) { synchronized(uploadSignal) { uploadSignal.notifyAll() } }
 
@@ -102,7 +100,7 @@ class RecorderService : Service() {
                 return
             }
             recording = true
-            status = "Recording $session"
+            status = "Recording since " + SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(startMillis))
 
             reader = Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
