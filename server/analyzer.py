@@ -524,6 +524,12 @@ def cmd_reanalyze(cfg, args):
             params.append(time.time() - args.since)
         names = [r[0] for r in db.execute(
             f"SELECT name FROM chunks WHERE {' AND '.join(where)} ORDER BY name", params)]
+        waiting = db.execute("SELECT count(*) FROM chunks WHERE location IN ('working','unanalyzed')").fetchone()[0]
+        if not names:
+            log("no archived chunks match" + (
+                f"; {waiting} chunk(s) haven't had their first analysis yet: "
+                "that's what 'analyzer.py run' does (the nightly run, safe to start by hand)" if waiting else ""))
+            return
         failed = 0
         for i, name in enumerate(names, 1):
             path = run.locate_any(name)
