@@ -281,6 +281,9 @@ class Run:
                   lambda db, path: self.ai_stage(db, path.name)] if self.sampling else []
         self.stages = stages + STAGES
         self._models = None  # loaded on first use: it takes a while and a GB of (V)RAM
+        # Dry run: files that a real run would have added, so the pruning forecast is right.
+        self.would_archive = []  # (name, size)
+        self.would_add_samples = []  # (sort key, size)
 
     def models(self):
         """The tagging/search models, or None. Loaded once per run."""
@@ -306,9 +309,6 @@ class Run:
             self.sampling.ai_chunk(db, m, self.locate_any, name)
         except Exception as e:
             log(f"tagging {name} failed: {type(e).__name__}: {e}")
-        # Dry run: files that a real run would have added, so the pruning forecast is right.
-        self.would_archive = []  # (name, size)
-        self.would_add_samples = []  # (sort key, size)
 
     def say(self, msg):
         log(("[dry run] " if self.dry else "") + msg)
