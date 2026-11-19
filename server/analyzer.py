@@ -7,6 +7,7 @@
     analyzer.py cut        EVENT_ID [--pad 0.5] [--out DIR]
     analyzer.py reanalyze  [--prefix 20261117] [--since 7d]
     analyzer.py web        [--bind IP] [--port 8676]   the review app (token: BUG_TOKEN)
+    analyzer.py find-text  "words"                   search transcripts (once transcription exists)
     (all take --config FILE)
 
 Each run finds unanalyzed chunks on the SSD working folder and in the HDD
@@ -33,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from names import LEGACY_RE, NAME_RE, day_folder, epoch_stamp, legacy_session_epoch, ogg_info  # noqa: E402
+import transcripts  # noqa: E402
 from receiver import (  # noqa: E402  (shared helpers)
     Conflict, chunk_files, human, is_any_chunk, legacy_assign, load_legacy_table, move_lock, move_verified,
     parse_size, remove_empty_dirs, save_legacy_table,
@@ -156,6 +158,7 @@ def open_db(path, dry=False):
         db = sqlite3.connect(path)
         db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    transcripts.ensure_schema(db)
     have = {row[1] for row in db.execute("PRAGMA table_info(chunks)")}
     for col, typ in CHUNK_COLUMNS.items():
         if col not in have:
@@ -551,6 +554,9 @@ def cmd_status(cfg, args):
         log("detected moments (candidate = found, proposed = cut into a clip):")
         for kind, status, n in rows:
             log(f"  {kind:<11} {status:<10} {n}")
+    n = transcripts.count(db)
+    if n:
+        log(f"transcript segments: {n}")
     if load_sampling()[0] is None:
         log(f"WARNING: detection unavailable: {load_sampling()[1]}")
 
@@ -655,6 +661,20 @@ def use_venv_if_needed():
         os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), *sys.argv])
 
 
+def cmd_find_text(cfg, args):
+    check_hdd(cfg)
+    db = open_db(cfg.db_path)
+    if not transcripts.count(db):
+        log("no transcripts yet: transcription arrives with milestone E")
+        return
+    hits = transcripts.search(db, " ".join(args.words), args.limit)
+    for h in hits:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["at"]))
+        log(f"{when}  ({h['end'] - h['at']:4.1f}s)  {h['text']}")
+    if not hits:
+        log("nothing matches")
+
+
 def cmd_web(cfg, args):
     check_hdd(cfg)
     import web
@@ -687,6 +707,10 @@ def main():
                                      "e.g. 20261117 for a day or 20261117T20 for an hour")
     ra.add_argument("--since", type=parse_age, help="only chunks archived within, e.g. 7d")
     ra.set_defaults(fn=cmd_reanalyze)
+    ft = sub.add_parser("find-text", help="search what was said (once transcription exists)")
+    ft.add_argument("words", nargs="+")
+    ft.add_argument("--limit", type=int, default=50)
+    ft.set_defaults(fn=cmd_find_text)
     w = sub.add_parser("web", help="the review app: browse, rate and tune in a browser")
     w.add_argument("--bind", default="127.0.0.1", help="your Tailscale IP to reach it from the phone")
     w.add_argument("--port", type=int, default=8676)

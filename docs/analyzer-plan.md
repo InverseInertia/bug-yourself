@@ -156,6 +156,13 @@ Each milestone is useful on its own:
 
 Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by about 2.4 GB a day with nothing archiving or pruning it. The web app comes right after detection, because detection can only be tuned by listening to what it proposes.
 
-## Deferred
+## Transcripts: what's already in place
+
+Milestone E only has to produce text. Storage, search and display already exist (`server/transcripts.py`):
+- **Storage:** a `transcript_segments` table holds the run, the chunk, sample positions, wall-clock start and end, text, an optional speaker, a confidence value, per-word timings as JSON, and the model name. An FTS5 full-text index is kept in step by triggers; if SQLite lacks FTS5, search falls back to a substring match.
+- **Writing:** `transcripts.store_chunk(db, chunk, run, chunk_start_sample, sr, run_epoch, segments, model)` is the one call the transcription stage makes per chunk. Segment times are in seconds from the chunk's first sample, and calling it again for the same chunk replaces that chunk's lines. The stage should use the same context and ownership rule as detection (15 s of the previous chunk, lines starting in a chunk's last 10 s belong to the next), so a sentence across a boundary is stored once.
+- **Reading:** `analyzer.py find-text`, the review app's timeline panel (it follows playback, and tapping a line jumps there), the "said" lines under a clip in the player, and `GET /api/search/text`. That search API is ready for a Search page.
+
+
 
 - **Speaker labels** (pyannote): not wanted for now. Transcripts are stored with sample positions, so labels can be added later without re-transcribing.

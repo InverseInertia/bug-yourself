@@ -9,6 +9,9 @@ Endpoints (JSON unless noted):
   GET  /api/clips?view=archive|staged|kept&kind=&sort=time|score&offset=&limit=
   GET  /api/timeline/coverage?from=&to=        recorded stretches between two epoch times
   GET  /api/timeline/audio?t=&dur=             WAV of the recordings from time t (X-Start, X-Next)
+  GET  /api/timeline/events?from=&to=&all=     clips (and with all=1 every detected moment) in a range
+  GET  /api/timeline/transcript?from=&to=      transcript lines in a range
+  GET  /api/search/text?q=                     transcript search
   GET  /api/run  /  POST /api/run              status of / start an analyzer run
   GET  /api/event/<id>           details, features, rating
   GET  /api/event/<id>/audio?pad=S   WAV cut from the source recording (X-Clip-Start/End: seconds)
@@ -34,6 +37,9 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import transcripts  # noqa: E402
 
 KINDS = ["percussive", "tonal", "loop", "texture"]
 AUDIO_EXT = {".flac", ".wav", ".ogg", ".mp3", ".aif", ".aiff", ".m4a"}
@@ -137,7 +143,27 @@ def event_details(app, ev_id):
             "e.start_sample, e.end_sample, e.sr, r.rating, c.id AS clip_id, c.state AS clip_state, c.path AS clip_path "
             "FROM events e LEFT JOIN ratings r ON r.event_id = e.id "
             "LEFT JOIN clips c ON c.event_id = e.id WHERE e.id = ?", (ev_id,)).fetchone()
-    return event_row(r) if r else None
+        if not r:
+            return None
+        said = transcripts.for_span(db, r["run"], r["start_sample"], r["end_sample"])
+    d = event_row(r)
+    d["transcript"] = said
+    return d
+
+
+def timeline_events(app, t0, t1, everything):
+    """Clips (and, with everything, all detected moments) overlapping [t0, t1)."""
+    where = "" if everything else "AND e.status = 'proposed'"
+    with app.db() as db:
+        rows = db.execute(
+            f"SELECT e.id, e.at_time, (e.end_sample - e.start_sample) * 1.0 / e.sr, e.kind, e.label, e.score, "
+            f"e.status, c.id, c.state, r.rating FROM events e "
+            f"LEFT JOIN clips c ON c.event_id = e.id LEFT JOIN ratings r ON r.event_id = e.id "
+            f"WHERE e.at_time < ? AND e.at_time + (e.end_sample - e.start_sample) * 1.0 / e.sr > ? {where} "
+            f"ORDER BY e.at_time LIMIT 20000", (t1, t0)).fetchall()
+    return {"events": [{"id": r[0], "at": r[1], "dur": r[2], "kind": r[3], "label": r[4], "score": r[5],
+                        "clip": r[6] == "proposed", "clip_id": r[7] if r[8] in ("new", "library") else None,
+                        "rating": r[9]} for r in rows]}
 
 
 def tuning_stats(app):
@@ -449,6 +475,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, data, "audio/wav", headers)
         if path == "/api/run":
             return self.send(200, run_status(app))
+        if path == "/api/timeline/events":
+            t0, t1 = float(q["from"]), float(q["to"])
+            if t1 - t0 > 8 * 86400:
+                raise ValueError("ask for at most 8 days at a time")
+            return self.send(200, timeline_events(app, t0, t1, q.get("all") == "1"))
+        if path == "/api/timeline/transcript":
+            with app.db() as db:
+                return self.send(200, {"segments": transcripts.between(db, float(q["from"]), float(q["to"])),
+                                       "total": transcripts.count(db)})
+        if path == "/api/search/text":
+            with app.db() as db:
+                return self.send(200, {"results": transcripts.search(db, q.get("q", ""), int(q.get("limit", 100))),
+                                       "total": transcripts.count(db)})
         if (m := re.fullmatch(r"/api/event/(\d+)", path)):
             ev = event_details(app, int(m[1]))
             return self.send(200, ev) if ev else self.send(404, {"error": "no such event"})

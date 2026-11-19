@@ -8,6 +8,7 @@
 :root {
   --bg: #15171c; --panel: #1d2027; --panel2: #252933; --line: #343947; --text: #e7e8ec; --dim: #9aa0ad;
   --accent: #5b8cff; --good: #3fbf7f; --bad: #e5534b; --wave: #8fb3ff; --shade: rgba(91,140,255,.16);
+  --k-percussive: #f0a03c; --k-tonal: #b07cff; --k-loop: #44c98a; --k-texture: #e06fa8; --cover: #5b8cff55;
 }
 @media (prefers-color-scheme: light) {
   :root { --bg: #f4f5f8; --panel: #fff; --panel2: #eef0f5; --line: #d9dce5; --text: #1d2027; --dim: #5f6675;
@@ -70,6 +71,19 @@ details.more summary { cursor: pointer; color: var(--dim); font-size: 13px; marg
 #tlzoom { height: 44px; }
 .tlaxis { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; margin: 4px 0 14px; }
 #tlnote { color: var(--dim); font-size: 13px; min-height: 1.2em; margin-top: 8px; }
+#tlhere { font-size: 14px; min-height: 1.4em; margin: -6px 0 10px; }
+#tlhere .k { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.kinds-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--dim); margin: -8px 0 12px; }
+.kinds-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+#tltranscript { max-width: 1100px; margin: 14px auto 0; }
+#tltranscript h3 { margin: 0 0 8px; font-size: 15px; }
+#tllines { max-height: 40vh; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+#tllines .line { display: grid; grid-template-columns: max-content 1fr; gap: 10px; padding: 5px 8px; border-radius: 6px; cursor: pointer; }
+#tllines .line:hover { background: var(--panel2); }
+#tllines .line.now { background: var(--shade); }
+#tllines .line time { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 2px; }
+#said { margin-top: 10px; font-size: 14px; }
+#said p { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line); }
 #title { font-size: 18px; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
 #subtitle { color: var(--dim); margin: 2px 0 10px; font-size: 13px; }
 .viz { position: relative; border-radius: 8px; overflow: hidden; background: var(--panel2); cursor: pointer; }
@@ -168,7 +182,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
       <a id="download" class="btn" style="flex:1 1 auto;text-align:center;text-decoration:none" download>Download</a>
     </div>
     <div id="msg"></div>
-    <details class="more" id="more-details"><summary>Details</summary><table class="feat" id="feat"></table></details>
+    <details class="more" id="more-details"><summary>Details</summary><div id="said"></div><table class="feat" id="feat"></table></details>
     <p class="hint"><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>W</kbd> widen · <kbd>G</kbd>/<kbd>B</kbd> rate · <kbd>0</kbd> clear</p>
   </aside>
 </main>
@@ -183,10 +197,17 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
     </div>
     <div id="tlclock">--:--:--</div>
     <div id="tldate">Tap the bar to start listening there.</div>
+    <div id="tlhere"></div>
     <canvas id="tlbar" class="tlbar"></canvas>
     <div class="tlaxis"><span>0:00</span><span>6:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
     <canvas id="tlzoom" class="tlbar" aria-label="The hour around the playhead"></canvas>
     <div class="tlaxis" id="tlzoomaxis"><span></span><span>the hour around the playhead</span><span></span></div>
+    <div class="kinds-legend">
+      <span><i style="background:var(--cover)"></i>recorded</span>
+      <span><i style="background:var(--k-percussive)"></i>hit</span><span><i style="background:var(--k-tonal)"></i>tonal</span>
+      <span><i style="background:var(--k-loop)"></i>loop</span><span><i style="background:var(--k-texture)"></i>texture</span>
+      <span>solid = clip, faint = detected only (zoomed bar)</span>
+    </div>
     <div class="controls">
       <button id="tlprevrec" title="Start of this / previous recording">⏮</button>
       <button id="tlback60" title="Back 1 min (shift+←)">−1m</button>
@@ -196,9 +217,17 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
       <button id="tlfwd60" title="Forward 1 min (shift+→)">+1m</button>
       <button id="tlnextrec" title="Next recording">⏭</button>
     </div>
+    <div class="controls">
+      <button id="tlprevclip" title="Previous clip (P)">◂ Clip</button>
+      <button id="tlnextclip" title="Next clip (N)">Clip ▸</button>
+    </div>
     <div id="tlnote"></div>
     <p class="hint">Plays the recordings as one continuous stream in this device's local time, straight across chunk
-      boundaries. Between recordings it jumps to the next one. Blue: recorded audio.</p>
+      boundaries. Between recordings it jumps to the next one. Tap a marker to jump to that moment.</p>
+  </div>
+  <div class="card" id="tltranscript">
+    <h3>Transcript</h3>
+    <div id="tllines"></div>
   </div>
 </main>
 
@@ -323,11 +352,12 @@ async function select(i, play) {
   $("#title").textContent = S.view === "kept" ? it.name : `${e.label} · ${e.kind}`;
   $("#subtitle").textContent = e ? `${fmtTime(e.at_time)} · score ${e.score.toFixed(2)} · #${e.id}` : it.folder;
   $("#download").href = S.view === "kept" ? `/api/kept/file?p=${it.file}` : it.clip_id ? `/api/clip/${it.clip_id}/file` : `/api/event/${it.id}/audio`;
-  $("#msg").textContent = ""; $("#feat").innerHTML = "";
+  $("#msg").textContent = ""; $("#feat").innerHTML = ""; $("#said").innerHTML = "";
   updateButtons();
   await loadAudio(play);
   if (e) getJSON(`/api/event/${e.id}`).then(d => {
     if (S.items[S.i] !== it) return;
+    $("#said").innerHTML = (d.transcript || []).map(l => `<p>“${esc(l.text)}”</p>`).join("");
     $("#feat").innerHTML = Object.entries(d.features).map(([k, v]) =>
       `<tr><td>${esc(k.replace(/_/g, " "))}</td><td>${esc(v)}</td></tr>`).join("");
   }).catch(() => {});
@@ -607,7 +637,7 @@ document.addEventListener("click", e => { if (!e.target.closest("#runlog, #runst
 // --- timeline -------------------------------------------------------------------
 // Plays recordings as one stream: fetches ~15 s pieces ahead of the playhead and
 // schedules each to start exactly where the previous one ends.
-const tl = { day: null, cover: null, t: null, playing: false, gen: 0, queue: [], next: null, ahead: 0, fetching: false, ended: false };
+const tl = { dayEvents: [], near: null, nearBusy: false, linesKey: "", nowLine: null, day: null, cover: null, t: null, playing: false, gen: 0, queue: [], next: null, ahead: 0, fetching: false, ended: false };
 const pad2 = n => String(n).padStart(2, "0");
 function dayStart(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime() / 1000; }
 function dayValue(t) { const d = new Date(t * 1000); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
@@ -620,6 +650,8 @@ async function tlLoadDay() {
   const t1 = tl.day + dayLength(tl.day);
   try { tl.cover = (await getJSON(`/api/timeline/coverage?from=${tl.day}&to=${t1}`)).segments; }
   catch (e) { tl.cover = []; $("#tlnote").textContent = e.message; }
+  tl.dayEvents = (await getJSON(`/api/timeline/events?from=${tl.day}&to=${t1}`).catch(() => ({ events: [] }))).events;
+  tl.near = null;
   if (!tl.cover.length) $("#tlnote").textContent = "No recordings on this day.";
   else if (!tl.playing) $("#tlnote").textContent = "";
   tlDraw();
@@ -633,7 +665,8 @@ function tlNow() {
 }
 // The zoomed bar shows the hour around the playhead (or around the pointer while dragging).
 function zoomStart() { const t = tl.t ?? tl.day + 12 * 3600; return t - 1800; }
-function drawBar(c, t0, len, tickEvery, majorEvery) {
+const kindColor = k => css("--k-" + k);
+function drawBar(c, t0, len, tickEvery, majorEvery, events) {
   const g = fitCanvas(c), w = c.width, h = c.height;
   g.clearRect(0, 0, w, h);
   g.fillStyle = css("--line");
@@ -641,23 +674,88 @@ function drawBar(c, t0, len, tickEvery, majorEvery) {
     const major = Math.round((k - tl.day) % majorEvery) === 0, x = Math.round((k - t0) / len * w);
     g.fillRect(x, h - (major ? 14 : 6), 1, major ? 14 : 6);
   }
-  g.fillStyle = css("--accent");
+  g.fillStyle = css("--cover");
   for (const s of tl.cover || []) {
     const a = Math.max(0, (s.start - t0) / len * w), b = Math.min(w, (s.end - t0) / len * w);
-    if (b > 0 && a < w) g.fillRect(a, h * 0.2, Math.max(2, b - a), h * 0.5);
+    if (b > 0 && a < w) g.fillRect(a, h * 0.3, Math.max(2, b - a), h * 0.4);
   }
+  const dpr = window.devicePixelRatio || 1;
+  for (const pass of [false, true]) {  // detected-only moments first, clips on top
+    for (const e of events || []) {
+      if (e.clip !== pass) continue;
+      const a = (e.at - t0) / len * w, b = (e.at + e.dur - t0) / len * w;
+      if (b < 0 || a > w) continue;
+      g.globalAlpha = pass ? 1 : 0.18 + 0.4 * e.score;
+      g.fillStyle = kindColor(e.kind);
+      const top = pass ? h * 0.08 : h * 0.3, ht = pass ? h * 0.72 : h * 0.4;
+      g.fillRect(a, top, Math.max(2 * dpr, b - a), ht);
+    }
+  }
+  g.globalAlpha = 1;
   const t = tlNow();
   if (t != null && t >= t0 && t < t0 + len) {
     g.fillStyle = css("--text");
-    g.fillRect(Math.round((t - t0) / len * w) - 1, 0, 2 * (window.devicePixelRatio || 1), h);
+    g.fillRect(Math.round((t - t0) / len * w) - 1, 0, 2 * dpr, h);
   }
 }
+async function tlFetchNear(center) {
+  // Every detected moment and transcript line for a few hours around `center`.
+  if (tl.nearBusy) return;
+  tl.nearBusy = true;
+  const from = center - 2 * 3600, to = center + 2 * 3600;
+  try {
+    const [ev, tr] = await Promise.all([getJSON(`/api/timeline/events?from=${from}&to=${to}&all=1`),
+                                        getJSON(`/api/timeline/transcript?from=${from}&to=${to}`)]);
+    tl.near = { from, to, events: ev.events, lines: tr.segments, total: tr.total };
+  } catch { tl.near = { from, to, events: [], lines: [], total: 0 }; }
+  tl.nearBusy = false;
+  tlDraw();
+}
+function nearFor(z0) {
+  const n = tl.near;
+  if (!n || z0 < n.from || z0 + 3600 > n.to) { tlFetchNear(z0 + 1800); return n && n.events ? n : null; }
+  return n;
+}
+function eventAt(t, events) {
+  const hits = (events || []).filter(e => t >= e.at && t < e.at + Math.max(e.dur, 0.2));
+  return hits.find(e => e.clip) || hits.sort((a, b) => b.score - a.score)[0] || null;
+}
+function renderLines(near, t) {
+  const box = $("#tllines");
+  if (!near) return;
+  const key = `${near.from}:${near.lines.length}:${near.total}`;
+  if (key !== tl.linesKey) {
+    tl.linesKey = key; tl.nowLine = null;
+    if (!near.total) box.innerHTML = `<div class="hint">No transcripts yet. Once transcription is set up, what was said shows here and follows playback.</div>`;
+    else if (!near.lines.length) box.innerHTML = `<div class="hint">Nothing transcribed around this time.</div>`;
+    else box.innerHTML = near.lines.map((l, i) => `<div class="line" data-i="${i}"><time>${
+      new Date(l.at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><span>${
+      l.speaker ? `<b>${esc(l.speaker)}:</b> ` : ""}${esc(l.text)}</span></div>`).join("");
+  }
+  const i = t == null ? -1 : near.lines.findIndex(l => t >= l.at && t < l.end);
+  if (i !== tl.nowLine) {
+    box.querySelector(".line.now")?.classList.remove("now");
+    const el = i >= 0 ? box.querySelector(`.line[data-i="${i}"]`) : null;
+    if (el) { el.classList.add("now"); el.scrollIntoView({ block: "nearest" }); }
+    tl.nowLine = i;
+  }
+}
+$("#tllines").addEventListener("click", e => {
+  const el = e.target.closest(".line"); if (!el || !tl.near) return;
+  tlSeekPlay(tl.near.lines[+el.dataset.i].at);
+});
 const hm = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 function tlDraw() {
   const t0 = tl.day, len = dayLength(t0);
-  drawBar($("#tlbar"), t0, len, 3600, 6 * 3600);
+  drawBar($("#tlbar"), t0, len, 3600, 6 * 3600, tl.dayEvents);
   const z0 = tl.zoomFrom ?? zoomStart();
-  drawBar($("#tlzoom"), z0, 3600, 300, 900);
+  const near = nearFor(z0);
+  drawBar($("#tlzoom"), z0, 3600, 300, 900, near ? near.events : tl.dayEvents);
+  const tt = tlNow(), here = tt == null ? null : eventAt(tt, near ? near.events : tl.dayEvents);
+  $("#tlhere").innerHTML = here ? `<span class="k" style="background:${kindColor(here.kind)}"></span>` +
+    `${esc(here.label)} · ${esc(here.kind)} · score ${here.score.toFixed(2)}` +
+    (here.clip ? ` · clip #${here.id}` : ` · detected #${here.id}`) + (here.rating === 1 ? " · rated good" : here.rating === -1 ? " · rated bad" : "") : "";
+  renderLines(near, tt);
   const ax = $("#tlzoomaxis").children; ax[0].textContent = hm(z0); ax[2].textContent = hm(z0 + 3600);
   const t = tlNow();
   if (t != null) {
@@ -738,20 +836,41 @@ function tlRecordingJump(dir) {
     if (nxt) tlSeek(nxt.start); else $("#tlnote").textContent = "No later recording on this day.";
   }
 }
-function scrubber(bar, range) {  // range() -> [start, length] of what the bar shows
-  let dragging = false, fixed = null;
+function scrubber(bar, range, events) {  // range() -> [start, length] of what the bar shows
+  let dragging = false, fixed = null, downX = 0;
   const at = e => { const r = bar.getBoundingClientRect(), [t0, len] = fixed;
                     return t0 + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * len; };
   bar.addEventListener("pointerdown", e => {
-    dragging = true; fixed = range(); bar.setPointerCapture(e.pointerId);
+    dragging = true; fixed = range(); downX = e.clientX; bar.setPointerCapture(e.pointerId);
     if (bar.id === "tlzoom") tl.zoomFrom = fixed[0];  // hold the zoom window still while dragging in it
     if (tl.playing) tlPause(); tl.t = at(e); tlDraw();
   });
   bar.addEventListener("pointermove", e => { if (dragging) { tl.t = at(e); tlDraw(); } });
-  bar.addEventListener("pointerup", e => { if (!dragging) return; dragging = false; tl.zoomFrom = null; tlPlay(at(e)); });
+  bar.addEventListener("pointerup", e => {
+    if (!dragging) return;
+    dragging = false; tl.zoomFrom = null;
+    let t = at(e);
+    if (Math.abs(e.clientX - downX) < 5) {  // a tap, not a drag: snap to a marker under the finger
+      const r = bar.getBoundingClientRect(), [t0, len] = fixed, slop = 8 / r.width * len;
+      // Nearest marker within reach; clips win over detected-only moments at similar distance.
+      const dist = m => t < m.at ? m.at - t : t > m.at + m.dur ? t - m.at - m.dur : 0;
+      const pick = (events() || []).filter(m => dist(m) <= slop)
+        .sort((a, b) => (dist(a) - dist(b)) + (b.clip - a.clip) * slop * 0.25)[0];
+      if (pick) t = pick.at;
+    }
+    tlPlay(t);
+  });
 }
-scrubber($("#tlbar"), () => [tl.day, dayLength(tl.day)]);
-scrubber($("#tlzoom"), () => [tl.zoomFrom ?? zoomStart(), 3600]);
+scrubber($("#tlbar"), () => [tl.day, dayLength(tl.day)], () => tl.dayEvents);
+scrubber($("#tlzoom"), () => [tl.zoomFrom ?? zoomStart(), 3600], () => tl.near ? tl.near.events : tl.dayEvents);
+function tlSeekPlay(t) { tlPlay(t); }
+function tlClipJump(dir) {
+  const t = tlNow() ?? tl.day, clips = tl.dayEvents.filter(e => e.clip);
+  // Like a music player: more than 3 s into a clip, "previous" restarts it.
+  const pick = dir > 0 ? clips.find(e => e.at > t + 0.5) : clips.filter(e => e.at < t - 3).pop();
+  if (pick) tlSeekPlay(pick.at); else $("#tlnote").textContent = dir > 0 ? "No later clip on this day." : "No earlier clip on this day.";
+}
+$("#tlprevclip").onclick = () => tlClipJump(-1); $("#tlnextclip").onclick = () => tlClipJump(1);
 $("#tlplay").onclick = () => tl.playing ? tlPause() : tlPlay(tl.t ?? (tl.cover && tl.cover[0] ? tl.cover[0].start : tl.day));
 $("#tlback10").onclick = () => tlStep(-10); $("#tlfwd10").onclick = () => tlStep(10);
 $("#tlback60").onclick = () => tlStep(-60); $("#tlfwd60").onclick = () => tlStep(60);
@@ -764,6 +883,8 @@ function tlKey(e, k) {
   if (k === " ") { e.preventDefault(); $("#tlplay").click(); }
   else if (k === "arrowright") { e.preventDefault(); tlStep(e.shiftKey ? 60 : 10); }
   else if (k === "arrowleft") { e.preventDefault(); tlStep(e.shiftKey ? -60 : -10); }
+  else if (k === "n") tlClipJump(1);
+  else if (k === "p") tlClipJump(-1);
 }
 
 // --- views --------------------------------------------------------------------
