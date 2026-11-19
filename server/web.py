@@ -6,7 +6,10 @@ same numpy/soundfile modules as detection.
 
 Endpoints (JSON unless noted):
   GET  /                         the app (web/index.html)
-  GET  /api/clips?view=proposed|kept&kind=&sort=time|score&offset=&limit=
+  GET  /api/clips?view=archive|staged|kept&kind=&sort=time|score&offset=&limit=
+  GET  /api/timeline/coverage?from=&to=        recorded stretches between two epoch times
+  GET  /api/timeline/audio?t=&dur=             WAV of the recordings from time t (X-Start, X-Next)
+  GET  /api/run  /  POST /api/run              status of / start an analyzer run
   GET  /api/event/<id>           details, features, rating
   GET  /api/event/<id>/audio?pad=S   WAV cut from the source recording (X-Clip-Start/End: seconds)
   GET  /api/clip/<id>/file       the clip file itself
@@ -23,7 +26,11 @@ import io
 import json
 import re
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -43,6 +50,12 @@ class App:
         self.cfg, self.token, self.analyzer = cfg, token, analyzer
         self.cookie = hashlib.sha256(("bug-yourself:" + token).encode()).hexdigest() if token else ""
         self.sampling, self.sampling_error = analyzer.load_sampling()
+        self.run_proc = None
+        self.run_log = deque(maxlen=200)
+        self.run_started = self.run_ended = None
+        self.run_exit = None
+        self.durations = {}  # chunk name -> (frames, sr), for the timeline
+        self.lock = threading.Lock()
 
     def db(self):
         db = sqlite3.connect(self.cfg.db_path, timeout=10)
@@ -72,8 +85,9 @@ def event_row(r):
 
 # --- queries ------------------------------------------------------------------
 
-def list_proposed(app, kind, sort, offset, limit):
-    where, params = ["e.status='proposed'", "c.state IN ('new','library')"], []
+def list_proposed(app, kind, sort, offset, limit, state):
+    """Clips: 'new' ones are staged on the SSD, 'library' ones are in the HDD archive."""
+    where, params = ["e.status='proposed'", "c.state = ?"], [state]
     if kind:
         where.append("e.kind=?")
         params.append(kind)
@@ -231,6 +245,137 @@ def save_tuning(app, body):
     app.cfg.quota, app.cfg.min_score = quota, min_score
 
 
+# --- running the analyzer from the app ----------------------------------------------
+
+def start_run(app):
+    """Start `analyzer.py run` (the nightly run) now. Its own lock keeps it from
+    overlapping the midnight run; if that's going, this one exits saying so."""
+    with app.lock:
+        if app.run_proc and app.run_proc.poll() is None:
+            raise RuntimeError("a run started from here is still going")
+        app.run_log.clear()
+        app.run_started, app.run_ended, app.run_exit = time.time(), None, None
+        app.run_proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve().parent / "analyzer.py"), "--config", str(app.cfg.path), "run"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            preexec_fn=lambda: __import__("os").nice(10))
+        proc = app.run_proc
+
+    def follow():
+        for line in proc.stdout:
+            app.run_log.append(line.rstrip())
+        app.run_exit = proc.wait()
+        app.run_ended = time.time()
+    threading.Thread(target=follow, daemon=True).start()
+
+
+def run_status(app):
+    running = bool(app.run_proc and app.run_proc.poll() is None)
+    return {"running": running, "started": app.run_started, "ended": app.run_ended,
+            "exit": app.run_exit, "log": list(app.run_log)[-40:]}
+
+
+# --- timeline ---------------------------------------------------------------------
+
+MAX_CHUNK_S = 3600  # longest chunk to expect; chunks starting this early can reach into a window
+
+
+def chunk_durations(app, names):
+    """(frames, sr) per chunk: from the DB when analyzed, else from the file's headers."""
+    need = [n for n in names if n not in app.durations]
+    if need:
+        with app.db() as db:
+            for i in range(0, len(need), 500):
+                part = need[i:i + 500]
+                for name, frames, sr in db.execute(
+                        f"SELECT name, frames, sr FROM chunks WHERE frames IS NOT NULL AND name IN "
+                        f"({','.join('?' * len(part))})", part):
+                    app.durations[name] = (frames, sr)
+    return app.durations
+
+
+def timeline_segments(app, t0, t1):
+    """Continuous stretches of recording overlapping [t0, t1), each a list of chunks.
+    Chunks are linked the same way the analyzer links them: one starts where the
+    previous one ended. Within a stretch, time runs on samples, so it's seamless."""
+    from names import chunk_epoch, continuous, day_folder, ogg_info
+    from receiver import chunk_files
+    days = {time.strftime("%Y%m%d", time.gmtime(t)) for t in range(int(t0 - MAX_CHUNK_S), int(t1) + 86400, 86400)}
+    found = {}
+    for root in (app.cfg.archive_dir, app.cfg.unanalyzed_dir, app.cfg.working_dir):
+        for day in days:
+            d = root / day
+            if d.is_dir():
+                for p in chunk_files(d):
+                    e = chunk_epoch(p.name)
+                    if e is not None and t0 - MAX_CHUNK_S <= e < t1:
+                        found.setdefault(p.name, p)
+    known = chunk_durations(app, list(found))
+    chunks = []
+    for name in sorted(found, key=chunk_epoch):
+        if name not in known:
+            try:
+                known[name] = ogg_info(found[name])
+            except (OSError, ValueError):
+                continue  # mid-upload or damaged: leave it out
+        frames, sr = known[name]
+        chunks.append((name, found[name], chunk_epoch(name), frames, sr))
+    segs = []
+    for name, path, epoch, frames, sr in chunks:
+        last = segs[-1] if segs else None
+        if last and last["sr"] == sr and continuous(last["chunks"][-1][2], last["chunks"][-1][3] / sr, epoch):
+            last["chunks"].append((name, path, epoch, frames, last["frames"]))
+            last["frames"] += frames
+        else:
+            segs.append({"start": float(epoch), "sr": sr, "frames": frames,
+                         "chunks": [(name, path, epoch, frames, 0)]})
+    for s in segs:
+        s["end"] = s["start"] + s["frames"] / s["sr"]
+    return [s for s in segs if s["end"] > t0]
+
+
+def timeline_coverage(app, t0, t1):
+    if t1 - t0 > 8 * 86400:
+        raise ValueError("ask for at most 8 days at a time")
+    return {"segments": [{"start": s["start"], "end": s["end"]} for s in timeline_segments(app, t0, t1)]}
+
+
+def timeline_audio(app, t, dur):
+    """Up to `dur` seconds of recorded audio from time t. If t falls between
+    recordings, starts at the next one (X-Start says where). X-Next is where
+    the following audio starts when this reply reaches the end of a recording."""
+    if app.sampling is None:
+        raise RuntimeError(f"playback unavailable: {app.sampling_error}")
+    import soundfile as sf
+    dur = min(60.0, max(1.0, dur))
+    segs = timeline_segments(app, t, t + 2 * 86400)
+    seg = next((s for s in segs if s["end"] > t), None)
+    if seg is None:
+        raise KeyError("no recordings after this time")
+    sr = seg["sr"]
+    a = max(0, int(round((t - seg["start"]) * sr)))
+    b = min(seg["frames"], a + int(dur * sr))
+    pieces = []
+    for name, path, _, frames, off in seg["chunks"]:
+        lo, hi = max(a, off), min(b, off + frames)
+        if lo < hi:
+            x, _ = app.sampling.read_mono(path, lo - off, hi - off)
+            pieces.append(x)
+    import numpy as np
+    x = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+    peak = float(np.max(np.abs(x))) if len(x) else 0.0
+    if peak > 1.0:
+        x = x * (0.999 / peak)
+    buf = io.BytesIO()
+    sf.write(buf, x, sr, format="WAV", subtype="PCM_16")
+    nxt = ""
+    if b >= seg["frames"]:
+        later = next((s for s in segs if s["start"] >= seg["end"]), None)
+        nxt = f"{later['start']:.3f}" if later else ""
+    return buf.getvalue(), {"X-Start": f"{seg['start'] + a / sr:.3f}", "X-Duration": f"{(b - a) / sr:.3f}",
+                            "X-Next": nxt}
+
+
 # --- HTTP ---------------------------------------------------------------------
 
 LOGIN_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -295,7 +440,15 @@ class Handler(BaseHTTPRequestHandler):
             offset, limit = int(q.get("offset", 0)), min(500, int(q.get("limit", 100)))
             if q.get("view") == "kept":
                 return self.send(200, list_kept(app, offset, limit))
-            return self.send(200, list_proposed(app, q.get("kind") or None, q.get("sort", "time"), offset, limit))
+            state = "new" if q.get("view") == "staged" else "library"
+            return self.send(200, list_proposed(app, q.get("kind") or None, q.get("sort", "time"), offset, limit, state))
+        if path == "/api/timeline/coverage":
+            return self.send(200, timeline_coverage(app, float(q["from"]), float(q["to"])))
+        if path == "/api/timeline/audio":
+            data, headers = timeline_audio(app, float(q["t"]), float(q.get("dur", 15)))
+            return self.send(200, data, "audio/wav", headers)
+        if path == "/api/run":
+            return self.send(200, run_status(app))
         if (m := re.fullmatch(r"/api/event/(\d+)", path)):
             ev = event_details(app, int(m[1]))
             return self.send(200, ev) if ev else self.send(404, {"error": "no such event"})
@@ -355,11 +508,16 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/tuning":
                 save_tuning(self.app, body)
                 return self.send(200, tuning_stats(self.app))
+            if url.path == "/api/run":
+                start_run(self.app)
+                return self.send(200, run_status(self.app))
             raise KeyError(url.path)
         except KeyError:
             return self.send(404, {"error": "not found"})
         except (ValueError, TypeError) as e:
             return self.send(400, {"error": str(e)})
+        except RuntimeError as e:
+            return self.send(409, {"error": str(e)})
 
 
 def serve(cfg, analyzer, bind, port, token):

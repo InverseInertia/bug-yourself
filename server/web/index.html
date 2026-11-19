@@ -18,7 +18,13 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 syst
 header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 10px 16px;
          background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
 header h1 { font-size: 17px; margin: 0 8px 0 0; }
-nav { display: flex; gap: 4px; }
+nav { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; max-width: 100%; }
+nav button { white-space: nowrap; }
+#runbox { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); }
+#runbox .btn { padding: 5px 10px; font-size: 13px; }
+#runstatus { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+#runlog { position: fixed; right: 16px; top: 60px; width: min(560px, calc(100vw - 32px)); max-height: 60vh; overflow: auto;
+          z-index: 5; font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap; margin: 0; }
 nav button, .chip { background: none; border: 1px solid transparent; color: var(--dim); padding: 6px 12px;
                     border-radius: 999px; font: inherit; cursor: pointer; }
 nav button.on { background: var(--panel2); color: var(--text); border-color: var(--line); }
@@ -30,7 +36,40 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; pa
 @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px; } }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
 #player { position: sticky; top: 70px; align-self: start; }
-@media (max-width: 900px) { #player { position: static; order: -1; } }
+@media (max-width: 900px) {
+  /* Split pane: header and player stay put, only the list scrolls. */
+  body.split { height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
+  body.split header { position: static; }
+  body.split #browse { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 10px 12px 0; }
+  body.split #player { position: static; order: -1; flex: none; padding: 10px 12px; align-self: stretch; }
+  body.split #browse > section { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 12px; }
+  #wave { height: 54px; } #spec { height: 84px; }
+  #player .controls { margin: 8px 0 0; } #player .controls button, #player .controls .btn { padding: 7px 8px; }
+  #player .hint { display: none; }
+  #title { font-size: 16px; } #subtitle { margin-bottom: 6px; }
+  /* Compact header: tabs on one row, run button and filters on the next. */
+  header { padding: 8px 12px; gap: 6px 8px; }
+  header h1 { display: none; }
+  nav { width: 100%; }
+  nav button { padding: 5px 10px; }
+  #runbox { flex: 1; min-width: 0; }
+  #runstatus { max-width: none; flex: 1; min-width: 0; }
+  .filters { margin-left: 0; }
+  .filters select { padding: 4px 6px; font-size: 13px; }
+}
+details.more summary { cursor: pointer; color: var(--dim); font-size: 13px; margin-top: 8px; }
+@media (min-width: 901px) { details.more summary { display: none; } }
+/* timeline */
+#timeline .card { max-width: 1100px; margin: 0 auto; }
+.tl-top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+.tl-top input[type=date] { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+                           padding: 5px 8px; font: inherit; }
+#tlclock { font: 600 34px/1.1 ui-monospace, monospace; font-variant-numeric: tabular-nums; margin: 4px 0 2px; }
+#tldate { color: var(--dim); font-size: 13px; margin-bottom: 12px; }
+.tlbar { width: 100%; height: 56px; display: block; border-radius: 8px; background: var(--panel2); cursor: pointer; touch-action: none; }
+#tlzoom { height: 44px; }
+.tlaxis { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; margin: 4px 0 14px; }
+#tlnote { color: var(--dim); font-size: 13px; min-height: 1.2em; margin-top: 8px; }
 #title { font-size: 18px; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
 #subtitle { color: var(--dim); margin: 2px 0 10px; font-size: 13px; }
 .viz { position: relative; border-radius: 8px; overflow: hidden; background: var(--panel2); cursor: pointer; }
@@ -87,10 +126,16 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
 <header>
   <h1>Bug Yourself</h1>
   <nav>
-    <button data-view="proposed" class="on">Proposed</button>
+    <button data-view="archive" class="on">Archive</button>
+    <button data-view="staged">Staged</button>
     <button data-view="kept">Kept</button>
+    <button data-view="timeline">Timeline</button>
     <button data-view="tuning">Tuning</button>
   </nav>
+  <div id="runbox">
+    <span id="runstatus" title="Show the run's output"></span>
+    <button class="btn" id="runbtn" title="Analyze what's waiting on the SSD and in unanalyzed/ now, like the nightly run">Run analyzer</button>
+  </div>
   <div class="filters" id="filters">
     <select id="kind" aria-label="Kind">
       <option value="">All kinds</option><option>percussive</option><option>tonal</option><option>loop</option><option>texture</option>
@@ -98,6 +143,8 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
     <select id="sort" aria-label="Sort"><option value="time">Newest first</option><option value="score">Best first</option></select>
   </div>
 </header>
+
+<pre class="card" id="runlog" hidden></pre>
 
 <main id="browse">
   <section>
@@ -121,12 +168,41 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
       <a id="download" class="btn" style="flex:1 1 auto;text-align:center;text-decoration:none" download>Download</a>
     </div>
     <div id="msg"></div>
-    <table class="feat" id="feat"></table>
+    <details class="more" id="more-details"><summary>Details</summary><table class="feat" id="feat"></table></details>
     <p class="hint"><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>W</kbd> widen · <kbd>G</kbd>/<kbd>B</kbd> rate · <kbd>0</kbd> clear</p>
   </aside>
 </main>
 
-<main id="tuning" hidden style="display:block">
+<main id="timeline" style="display:none">
+  <div class="card">
+    <div class="tl-top">
+      <button class="btn" id="tlprevday" title="Previous day">◀</button>
+      <input type="date" id="tlday" aria-label="Day">
+      <button class="btn" id="tlnextday" title="Next day">▶</button>
+      <button class="btn" id="tltoday">Today</button>
+    </div>
+    <div id="tlclock">--:--:--</div>
+    <div id="tldate">Tap the bar to start listening there.</div>
+    <canvas id="tlbar" class="tlbar"></canvas>
+    <div class="tlaxis"><span>0:00</span><span>6:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+    <canvas id="tlzoom" class="tlbar" aria-label="The hour around the playhead"></canvas>
+    <div class="tlaxis" id="tlzoomaxis"><span></span><span>the hour around the playhead</span><span></span></div>
+    <div class="controls">
+      <button id="tlprevrec" title="Start of this / previous recording">⏮</button>
+      <button id="tlback60" title="Back 1 min (shift+←)">−1m</button>
+      <button id="tlback10" title="Back 10 s (←)">−10s</button>
+      <button id="tlplay" title="Play / pause (space)">Play</button>
+      <button id="tlfwd10" title="Forward 10 s (→)">+10s</button>
+      <button id="tlfwd60" title="Forward 1 min (shift+→)">+1m</button>
+      <button id="tlnextrec" title="Next recording">⏭</button>
+    </div>
+    <div id="tlnote"></div>
+    <p class="hint">Plays the recordings as one continuous stream in this device's local time, straight across chunk
+      boundaries. Between recordings it jumps to the next one. Blue: recorded audio.</p>
+  </div>
+</main>
+
+<main id="tuning" style="display:none">
   <div class="bar">
     <span class="hint" style="margin:0">Preview over the last</span>
     <select id="days"><option value="7">7 days</option><option value="14" selected>14 days</option>
@@ -149,7 +225,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
 "use strict";
 const $ = s => document.querySelector(s);
 const KINDS = ["percussive", "tonal", "loop", "texture"];
-const S = { view: "proposed", items: [], total: 0, i: -1, widen: false, buffer: null, src: null, startedAt: 0,
+const S = { view: "archive", items: [], total: 0, i: -1, widen: false, buffer: null, src: null, startedAt: 0,
             clipStart: 0, clipEnd: 0, tuning: null, previewOf: null, req: 0 };
 let ctx = null;
 
@@ -183,7 +259,9 @@ async function loadList(append) {
       ? `${data.total} file(s) in ${data.dirs.join(", ")}`
       : "No kept folders configured: add kept_dirs = [\"~/Music/keepers\"] near the top of analyzer.toml.";
   } else {
-    $("#listinfo").textContent = `${data.total} proposed clip(s)`;
+    $("#listinfo").textContent = S.view === "staged"
+      ? `${data.total} clip(s) staged on the SSD; they move to the archive at the next nightly run`
+      : `${data.total} clip(s) in the archive`;
   }
   renderList();
   if (!append && S.items.length) select(0, false);
@@ -194,7 +272,7 @@ function setPreview(kind, data) {
   S.view = "preview"; S.previewOf = kind; S.items = data.items; S.total = data.items.length;
   showBrowse();
   $("#listinfo").innerHTML = `Preview: ${data.would_propose} ${esc(kind)} clip(s) at these settings ` +
-    `(${data.currently_proposed} proposed now). <a href="#" id="back">Back to tuning</a>`;
+    `(${data.currently_proposed} clipped now). <a href="#" id="back">Back to tuning</a>`;
   $("#back").onclick = e => { e.preventDefault(); switchView("tuning"); };
   renderList(); if (S.items.length) select(0, false); else clearPlayer();
 }
@@ -326,6 +404,7 @@ document.addEventListener("keydown", e => {
   if (e.target.matches("input, select, textarea") || e.metaKey || e.ctrlKey || e.altKey) return;
   if (S.view === "tuning") return;
   const k = e.key.toLowerCase();
+  if (S.view === "timeline") return tlKey(e, k);
   if (k === " ") { e.preventDefault(); $("#play").click(); }
   else if (k === "arrowright" || k === "j") { e.preventDefault(); select(S.i + 1, true); }
   else if (k === "arrowleft" || k === "k") { e.preventDefault(); select(S.i - 1, true); }
@@ -436,7 +515,7 @@ async function loadTuning() {
     }).join("");
     return `<div class="card kcard" data-kind="${k}">
       <h3>${k}</h3>
-      <div class="stats">${s.detected} detected · ${s.proposed} proposed · ${s.good} good / ${s.bad} bad rated</div>
+      <div class="stats">${s.detected} detected · ${s.proposed} clipped · ${s.good} good / ${s.bad} bad rated</div>
       <div class="hist">${bars}<div class="cut"></div></div>
       <div class="axis"><span>0</span><span>0.5</span><span>1</span></div>
       <label class="slider">Min score <input type="range" min="0" max="1" step="0.01" name="min_score" value="${t.min_score[k]}"><output></output></label>
@@ -477,7 +556,7 @@ function schedulePreview(card, delay = 200) {
     const rated = d.rated_good + d.rated_bad;
     card.querySelector(".pv").innerHTML =
       `Would cut <b>${d.would_propose}</b> clip(s) over ${d.days >= 3650 ? "everything" : d.days + " days"} ` +
-      `(${d.currently_proposed} proposed now, ${d.both} in both).` +
+      `(${d.currently_proposed} clipped now, ${d.both} in both).` +
       (rated ? `<br>Of those you rated: ${d.rated_good} good, ${d.rated_bad} bad.` : "");
   }, delay);
 }
@@ -489,27 +568,232 @@ $("#save").onclick = async () => {
   catch (e) { $("#savemsg").textContent = "Couldn't save: " + e.message; }
 };
 
-// --- views --------------------------------------------------------------------
-function showBrowse() {
-  $("#browse").hidden = false; $("#tuning").hidden = true; $("#filters").style.visibility = "visible";
-  $("#browse").style.display = ""; $("#tuning").style.display = "none";
+// --- analyzer runs ------------------------------------------------------------
+let runPoll = null;
+function showRun(st) {
+  const last = st.log.filter(l => l.trim()).slice(-1)[0] || "";
+  if (st.running) {
+    $("#runstatus").textContent = "Running… " + last;
+    $("#runbtn").disabled = true;
+  } else if (st.ended) {
+    const when = new Date(st.ended * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const summary = st.log.filter(l => /^(chunks|clips):/.test(l)).join(" · ") || last;
+    $("#runstatus").textContent = (st.exit === 0 ? `Done ${when}: ` : `Stopped ${when}: `) + summary;
+    $("#runbtn").disabled = false;
+  } else {
+    $("#runstatus").textContent = ""; $("#runbtn").disabled = false;
+  }
+  $("#runlog").textContent = st.log.join("\n") || "No output yet.";
 }
+async function pollRun() {
+  const st = await getJSON("/api/run").catch(() => null);
+  if (!st) return;
+  showRun(st);
+  if (st.running && !runPoll) runPoll = setInterval(pollRun, 2000);
+  if (!st.running && runPoll) {
+    clearInterval(runPoll); runPoll = null;
+    S.tuning = null; tl.cover = null;  // new clips, chunks and stats: refresh what's on screen
+    if (["archive", "staged", "kept"].includes(S.view)) loadList(false);
+    if (S.view === "timeline") tlLoadDay();
+  }
+}
+$("#runbtn").onclick = async () => {
+  try { showRun(await post("/api/run", {})); } catch (e) { $("#runstatus").textContent = e.message; }
+  pollRun();
+};
+$("#runstatus").onclick = () => { $("#runlog").hidden = !$("#runlog").hidden; };
+document.addEventListener("click", e => { if (!e.target.closest("#runlog, #runstatus")) $("#runlog").hidden = true; });
+
+// --- timeline -------------------------------------------------------------------
+// Plays recordings as one stream: fetches ~15 s pieces ahead of the playhead and
+// schedules each to start exactly where the previous one ends.
+const tl = { day: null, cover: null, t: null, playing: false, gen: 0, queue: [], next: null, ahead: 0, fetching: false, ended: false };
+const pad2 = n => String(n).padStart(2, "0");
+function dayStart(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime() / 1000; }
+function dayValue(t) { const d = new Date(t * 1000); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+function fromDayValue(v) { const [y, m, d] = v.split("-").map(Number); return new Date(y, m - 1, d).getTime() / 1000; }
+function dayLength(t0) { const d = new Date(t0 * 1000); d.setDate(d.getDate() + 1); return d.getTime() / 1000 - t0; }  // 23/25 h on DST days
+
+async function tlLoadDay() {
+  if (tl.day == null) tl.day = dayStart(Date.now());
+  $("#tlday").value = dayValue(tl.day);
+  const t1 = tl.day + dayLength(tl.day);
+  try { tl.cover = (await getJSON(`/api/timeline/coverage?from=${tl.day}&to=${t1}`)).segments; }
+  catch (e) { tl.cover = []; $("#tlnote").textContent = e.message; }
+  if (!tl.cover.length) $("#tlnote").textContent = "No recordings on this day.";
+  else if (!tl.playing) $("#tlnote").textContent = "";
+  tlDraw();
+}
+function tlNow() {
+  if (!tl.playing || !ctx) return tl.t;
+  const now = ctx.currentTime;
+  for (const q of tl.queue) if (now >= q.when && now < q.when + q.dur) return q.epoch + (now - q.when);
+  const first = tl.queue[0];
+  return first && now < first.when ? first.epoch : tl.t;
+}
+// The zoomed bar shows the hour around the playhead (or around the pointer while dragging).
+function zoomStart() { const t = tl.t ?? tl.day + 12 * 3600; return t - 1800; }
+function drawBar(c, t0, len, tickEvery, majorEvery) {
+  const g = fitCanvas(c), w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = css("--line");
+  for (let k = Math.ceil(t0 / tickEvery) * tickEvery; k < t0 + len; k += tickEvery) {
+    const major = Math.round((k - tl.day) % majorEvery) === 0, x = Math.round((k - t0) / len * w);
+    g.fillRect(x, h - (major ? 14 : 6), 1, major ? 14 : 6);
+  }
+  g.fillStyle = css("--accent");
+  for (const s of tl.cover || []) {
+    const a = Math.max(0, (s.start - t0) / len * w), b = Math.min(w, (s.end - t0) / len * w);
+    if (b > 0 && a < w) g.fillRect(a, h * 0.2, Math.max(2, b - a), h * 0.5);
+  }
+  const t = tlNow();
+  if (t != null && t >= t0 && t < t0 + len) {
+    g.fillStyle = css("--text");
+    g.fillRect(Math.round((t - t0) / len * w) - 1, 0, 2 * (window.devicePixelRatio || 1), h);
+  }
+}
+const hm = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function tlDraw() {
+  const t0 = tl.day, len = dayLength(t0);
+  drawBar($("#tlbar"), t0, len, 3600, 6 * 3600);
+  const z0 = tl.zoomFrom ?? zoomStart();
+  drawBar($("#tlzoom"), z0, 3600, 300, 900);
+  const ax = $("#tlzoomaxis").children; ax[0].textContent = hm(z0); ax[2].textContent = hm(z0 + 3600);
+  const t = tlNow();
+  if (t != null) {
+    const d = new Date(t * 1000);
+    $("#tlclock").textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    $("#tldate").textContent = d.toLocaleDateString([], { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+  }
+}
+function tlStopAudio() {
+  tl.gen++;
+  for (const q of tl.queue) { try { q.src.stop(); } catch {} }
+  tl.queue = []; tl.fetching = false;
+}
+function tlPlay(t) {
+  stop();  // the clip player
+  tl.t = t; tlStopAudio();
+  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === "suspended") ctx.resume();
+  tl.playing = true; tl.ended = false; tl.next = t; tl.lastEnd = null; tl.ahead = ctx.currentTime + 0.15;
+  $("#tlplay").textContent = "Pause"; $("#tlnote").textContent = "";
+  tlPump(); requestAnimationFrame(tlTick);
+}
+function tlPause() { tl.t = tlNow(); tl.playing = false; tlStopAudio(); $("#tlplay").textContent = "Play"; tlDraw(); }
+async function tlPump() {
+  if (!tl.playing || tl.fetching || tl.ended || tl.ahead - ctx.currentTime > 20) return;
+  tl.fetching = true;
+  const gen = tl.gen;
+  try {
+    const r = await api(`/api/timeline/audio?t=${tl.next}&dur=15`);
+    const start = parseFloat(r.headers.get("X-Start")), next = r.headers.get("X-Next");
+    const buf = await ctx.decodeAudioData(await r.arrayBuffer());
+    if (gen !== tl.gen) return;
+    // A jump over a stretch with no recording: either this reply started later than
+    // asked, or the previous reply already pointed past a gap.
+    const gap = start - (tl.lastEnd ?? tl.next) > 1 ? start - (tl.lastEnd ?? tl.next) : 0;
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(ctx.destination);
+    const when = Math.max(tl.ahead, ctx.currentTime + 0.05);
+    src.start(when);
+    tl.queue.push({ src, when, epoch: start, dur: buf.duration, gap });
+    tl.lastEnd = start + buf.duration;
+    tl.queue = tl.queue.filter(q => q.when + q.dur > ctx.currentTime - 1);
+    tl.ahead = when + buf.duration;
+    tl.next = next ? parseFloat(next) : start + buf.duration;
+  } catch (e) {
+    if (gen !== tl.gen) return;
+    tl.ended = true;
+    $("#tlnote").textContent = /no recordings|not found/.test(e.message) ? "End of the recordings." : e.message;
+  } finally {
+    if (gen === tl.gen) { tl.fetching = false; setTimeout(tlPump, 200); }
+  }
+}
+function gapText(sec) {
+  const mins = Math.max(1, Math.round(sec / 60));
+  return `Skipped ${mins >= 60 ? Math.floor(mins / 60) + " h " + (mins % 60) + " min" : mins + " min"} with no recording.`;
+}
+function tlTick() {
+  if (!tl.playing) return;
+  const t = tlNow(); if (t != null) tl.t = t;
+  const now = ctx.currentTime, cur = tl.queue.find(q => now >= q.when && now < q.when + q.dur);
+  if (cur && cur.gap && !cur.noted) {  // announce a skipped gap when playback actually reaches it
+    cur.noted = true; $("#tlnote").textContent = gapText(cur.gap);
+    if (cur.epoch >= tl.day + dayLength(tl.day)) { tl.day = dayStart(cur.epoch * 1000); tlLoadDay(); }
+  }
+  if (tl.ended && ctx.currentTime > tl.ahead) { tlPause(); return; }
+  tlDraw(); tlPump();
+  requestAnimationFrame(tlTick);
+}
+function tlSeek(t) { if (tl.playing) tlPlay(t); else { tl.t = t; tlDraw(); } }
+function tlStep(d) { const t = (tlNow() ?? tl.day) + d; tlSeek(t); }
+function tlRecordingJump(dir) {
+  const t = tlNow() ?? tl.day, segs = tl.cover || [];
+  if (dir < 0) {
+    const cur = segs.filter(s => s.start < t - 2).pop();  // start of this recording, or the one before
+    if (cur) tlSeek(cur.start);
+  } else {
+    const nxt = segs.find(s => s.start > t + 0.5);
+    if (nxt) tlSeek(nxt.start); else $("#tlnote").textContent = "No later recording on this day.";
+  }
+}
+function scrubber(bar, range) {  // range() -> [start, length] of what the bar shows
+  let dragging = false, fixed = null;
+  const at = e => { const r = bar.getBoundingClientRect(), [t0, len] = fixed;
+                    return t0 + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * len; };
+  bar.addEventListener("pointerdown", e => {
+    dragging = true; fixed = range(); bar.setPointerCapture(e.pointerId);
+    if (bar.id === "tlzoom") tl.zoomFrom = fixed[0];  // hold the zoom window still while dragging in it
+    if (tl.playing) tlPause(); tl.t = at(e); tlDraw();
+  });
+  bar.addEventListener("pointermove", e => { if (dragging) { tl.t = at(e); tlDraw(); } });
+  bar.addEventListener("pointerup", e => { if (!dragging) return; dragging = false; tl.zoomFrom = null; tlPlay(at(e)); });
+}
+scrubber($("#tlbar"), () => [tl.day, dayLength(tl.day)]);
+scrubber($("#tlzoom"), () => [tl.zoomFrom ?? zoomStart(), 3600]);
+$("#tlplay").onclick = () => tl.playing ? tlPause() : tlPlay(tl.t ?? (tl.cover && tl.cover[0] ? tl.cover[0].start : tl.day));
+$("#tlback10").onclick = () => tlStep(-10); $("#tlfwd10").onclick = () => tlStep(10);
+$("#tlback60").onclick = () => tlStep(-60); $("#tlfwd60").onclick = () => tlStep(60);
+$("#tlprevrec").onclick = () => tlRecordingJump(-1); $("#tlnextrec").onclick = () => tlRecordingJump(1);
+$("#tlday").onchange = () => { if ($("#tlday").value) { tl.day = fromDayValue($("#tlday").value); tlLoadDay(); } };
+$("#tlprevday").onclick = () => { tl.day = dayStart((tl.day - 3600) * 1000); tlLoadDay(); };
+$("#tlnextday").onclick = () => { tl.day = dayStart((tl.day + dayLength(tl.day) + 3600) * 1000); tlLoadDay(); };
+$("#tltoday").onclick = () => { tl.day = dayStart(Date.now()); tlLoadDay(); };
+function tlKey(e, k) {
+  if (k === " ") { e.preventDefault(); $("#tlplay").click(); }
+  else if (k === "arrowright") { e.preventDefault(); tlStep(e.shiftKey ? 60 : 10); }
+  else if (k === "arrowleft") { e.preventDefault(); tlStep(e.shiftKey ? -60 : -10); }
+}
+
+// --- views --------------------------------------------------------------------
+const PANES = { browse: ["archive", "staged", "kept", "preview"], timeline: ["timeline"], tuning: ["tuning"] };
+function showPane(v) {
+  const pane = Object.keys(PANES).find(p => PANES[p].includes(v));
+  for (const p of Object.keys(PANES)) $("#" + p).style.display = p === pane ? (p === "browse" ? "" : "block") : "none";
+  $("#filters").style.display = pane === "browse" ? "" : "none";
+  document.body.classList.toggle("split", pane === "browse");
+}
+function showBrowse() { showPane("preview"); }
 function switchView(v) {
-  stop(); S.view = v; S.widen = false;
+  stop(); if (v !== "timeline" && tl.playing) tlPause();
+  S.view = v; S.widen = false;
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.view === v));
+  showPane(v);
   if (v === "tuning") {
-    $("#browse").style.display = "none"; $("#tuning").style.display = "block"; $("#filters").style.visibility = "hidden";
     if (!S.tuning) loadTuning(); else document.querySelectorAll(".kcard").forEach(c => schedulePreview(c, 0));
     return;
   }
-  showBrowse();
+  if (v === "timeline") { if (!tl.cover) tlLoadDay(); else tlDraw(); return; }
   $("#sort").disabled = $("#kind").disabled = v === "kept";
   loadList(false).catch(e => { $("#listinfo").textContent = e.message; });
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => switchView(b.dataset.view));
 $("#kind").onchange = $("#sort").onchange = () => loadList(false);
-$("#tuning").style.display = "none";
-switchView("proposed");
+if (matchMedia("(min-width: 901px)").matches) $("#more-details").open = true;
+window.addEventListener("resize", () => { if (S.view === "timeline") tlDraw(); });
+switchView("archive");
+pollRun();
 </script>
 </body>
 </html>

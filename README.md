@@ -63,12 +63,15 @@ python3 server/analyzer.py list
 
 ### Review app
 
-The review app runs at `http://<tailscale-ip>:8676` and works on the phone too; sign in with the same token as uploads. It has three pages:
-- **Proposed** steps through the clips with a waveform and spectrogram. **Widen** replays a clip with 3 s of the surrounding recording, so you can hear whether a better cut sits just outside it.
+The review app runs at `http://<tailscale-ip>:8676` and works on the phone too; sign in with the same token as uploads. Its tabs:
+- **Archive** and **Staged** step through the clips with a waveform and spectrogram. Archive holds clips in the HDD library; Staged holds the newest ones, still on the SSD until the next nightly run. **Widen** replays a clip with 3 s of the surrounding recording, so you can hear whether a better cut sits just outside it.
 - **Kept** browses the folders you move keepers into (`kept_dirs` in `analyzer.toml`). A kept clip that still has its original name is linked back to where it came from.
+- **Timeline** plays the recordings as one continuous stream in your local time. Tap or drag the day bar, or the zoomed bar showing the hour around the playhead, to start anywhere. Playback runs seamlessly across chunk boundaries and jumps over stretches with no recording. Buttons step ±10 s or ±1 min, or jump to the previous or next recording.
 - **Tuning** shows, for each kind, a score histogram coloured by your ratings. A slider for the score cutoff and one for clips per hour re-rank the stored scores instantly. "Listen to this setting" plays exactly what that setting would cut, including moments that aren't clips yet. Saving writes `[detect]` in `analyzer.toml` for the next nightly run.
 
-Keys: `space` play, `←`/`→` step, `W` widen, `G`/`B` rate good/bad, `0` clear the rating. Ratings never move or delete files.
+**Run analyzer** in the header starts the nightly run right away: it analyzes what's waiting on the SSD and in `unanalyzed/`, cuts clips, and moves staged clips to the archive. Tap its status line for the full output. It can't overlap the midnight run; if that one is going, it says so and stops.
+
+Keys: `space` play, `←`/`→` step (on Timeline: ±10 s, with shift ±1 min), `W` widen, `G`/`B` rate good/bad, `0` clear the rating. Ratings never move or delete files. On a phone, the player stays at the top and only the list below it scrolls.
 
 Housekeeping needs only Python 3.11+. Detection needs numpy, scipy and soundfile; the installer puts them in a private virtualenv. Without them, chunks wait in `unanalyzed/` instead of being archived undetected. Configuration lives in `~/.config/bug-yourself/analyzer.toml` (template: `server/analyzer.example.toml`). The HDD folder must contain an empty `.bug-yourself-archive` marker file, or the analyzer refuses to run, so an unmounted drive is never treated as empty.
 
