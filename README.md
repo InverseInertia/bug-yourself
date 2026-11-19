@@ -61,12 +61,23 @@ python3 server/analyzer.py list
 
 `list` shows proposed clips; `--all` includes everything detected, `--kind tonal` filters, and `--best` sorts by score. `cut <id> --pad 1` re-cuts a moment with a second of extra audio either side, and `reanalyze` runs detection over chunks that are already archived (for example everything recorded before detection existed). Clip counts and score cutoffs are set under `[detect]` in `analyzer.toml`.
 
+### Tags and sound search
+
+Install with `server/install.sh --with-ai` (PyTorch and transformers, about 3 GB; the two models download about 1 GB more on first use and run on the RTX 3080 when it has room). The nightly run then names each moment by what it sounds like, using the 527 AudioSet classes (`glass-E4`, `snare-drum`), and makes it findable by description:
+
+```bash
+python3 server/analyzer.py search glass clinking
+```
+
+`analyzer.py tag` adds tags and search vectors to anything analyzed before AI was installed. The review app's **Search** tab does the same searches, plus searching what was said once transcription exists.
+
 ### Review app
 
 The review app runs at `http://<tailscale-ip>:8676` and works on the phone too; sign in with the same token as uploads. Its tabs:
 - **Archive** and **Staged** step through the clips with a waveform and spectrogram. Archive holds clips in the HDD library; Staged holds the newest ones, still on the SSD until the next nightly run. **Widen** replays a clip with 3 s of the surrounding recording, so you can hear whether a better cut sits just outside it.
 - **Kept** browses the folders you move keepers into (`kept_dirs` in `analyzer.toml`). A kept clip that still has its original name is linked back to where it came from.
 - **Timeline** plays the recordings as one continuous stream in your local time. Tap or drag the day bar, or the zoomed bar showing the hour around the playhead, to start anywhere. Playback runs seamlessly across chunk boundaries and jumps over stretches with no recording. Buttons step ±10 s or ±1 min, or jump to the previous or next recording or clip (`P`/`N`). To keep part of the stream, set a selection: `[` and `]` (or the buttons) mark the start and end at the playhead, "Select moment" takes the bounds of the moment under the playhead, and the − and + buttons nudge either end by 0.05 s (0.5 s with shift). "Play selection" plays just that stretch. "Download" saves it as FLAC or 24/16-bit WAV, or saves the minute from the playhead if nothing is selected. "Make clip" saves it as a clip of kind "made by you" in Staged, where it follows the same storage rules as the nightly clips. Detected moments are marked in each kind's colour: clips solid on both bars, other detected moments faint on the zoomed bar. Tap a marker to jump to it, and a caption names the moment under the playhead. Below the bars, the transcript of the surrounding hour follows playback, and tapping a line jumps there. Transcripts arrive with transcription (milestone E); the panel says so until then.
+- **Search** finds detected moments and stretches of recording by description ("low hum"), or lines of the transcript. Any result plays in the player, and **In timeline** (in every tab) opens the timeline at that moment.
 - **Tuning** shows, for each kind, a score histogram coloured by your ratings. A slider for the score cutoff and one for clips per hour re-rank the stored scores instantly. "Listen to this setting" plays exactly what that setting would cut, including moments that aren't clips yet. Saving writes `[detect]` in `analyzer.toml` for the next nightly run.
 
 **Run analyzer** in the header starts the nightly run right away: it analyzes what's waiting on the SSD and in `unanalyzed/`, cuts clips, and moves staged clips to the archive. Tap its status line for the full output. It can't overlap the midnight run; if that one is going, it says so and stops.

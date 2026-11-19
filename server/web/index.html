@@ -82,6 +82,10 @@ details.more summary { cursor: pointer; color: var(--dim); font-size: 13px; marg
 #tllines .line:hover { background: var(--panel2); }
 #tllines .line.now { background: var(--shade); }
 #tllines .line time { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 2px; }
+.searchbar { display: flex; gap: 8px; margin-bottom: 10px; }
+.searchbar input { flex: 1; min-width: 0; background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+                   border-radius: 8px; padding: 8px 10px; font: inherit; }
+#tags { color: var(--dim); font-size: 13px; margin: -6px 0 8px; min-height: 1em; }
 .selinfo { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; font-size: 13px; color: var(--dim); margin: 10px 0 0; }
 .selinfo b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
 .selinfo button { width: 26px; height: 24px; padding: 0; margin-left: 2px; border-radius: 6px; border: 1px solid var(--line);
@@ -149,6 +153,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
     <button data-view="staged">Staged</button>
     <button data-view="kept">Kept</button>
     <button data-view="timeline">Timeline</button>
+    <button data-view="search">Search</button>
     <button data-view="tuning">Tuning</button>
   </nav>
   <div id="runbox">
@@ -167,6 +172,11 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
 
 <main id="browse">
   <section>
+    <form id="searchbar" class="searchbar" hidden>
+      <input id="q" type="search" placeholder="Describe a sound, e.g. glass clinking" autocomplete="off" aria-label="Search">
+      <select id="qmode" aria-label="Search for"><option value="sound">Sounds</option><option value="text">Words said</option></select>
+      <button class="btn primary">Search</button>
+    </form>
     <div id="listinfo" class="hint" style="margin:0 0 8px"></div>
     <div class="list" id="list"></div>
     <button class="btn" id="more" hidden>Load more</button>
@@ -174,6 +184,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
   <aside class="card" id="player">
     <p id="title">Nothing selected</p>
     <p id="subtitle">Pick a clip from the list.</p>
+    <p id="tags"></p>
     <div class="viz" id="vizwrap"><canvas id="wave"></canvas><canvas id="spec"></canvas></div>
     <div class="controls">
       <button id="prev" title="Previous (←)">◀</button>
@@ -185,6 +196,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
       <button id="good" class="good" title="Good (G)">Good</button>
       <button id="bad" class="bad" title="Bad (B)">Bad</button>
       <a id="download" class="btn" style="flex:1 1 auto;text-align:center;text-decoration:none" download>Download</a>
+      <button id="totimeline" title="Open the timeline here">In timeline</button>
     </div>
     <div id="msg"></div>
     <details class="more" id="more-details"><summary>Details</summary><div id="said"></div><table class="feat" id="feat"></table></details>
@@ -297,7 +309,15 @@ const fmtTime = t => new Date(t * 1000).toLocaleString([], { month: "short", day
                                                             minute: "2-digit", second: "2-digit" });
 const fmtDur = d => d < 10 ? d.toFixed(2) + " s" : d.toFixed(1) + " s";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-function ev(item) { return S.view === "kept" ? item.event : item; }
+function ev(item) {
+  if (S.view === "kept") return item.event;
+  return item.type === "window" || item.type === "said" ? null : item;  // stretches have no moment to rate
+}
+// A stretch of recording to play: search hits that aren't detected moments.
+const spanURL = (it, dl) => `/api/timeline/cut?` + new URLSearchParams({
+  from: it.type === "said" ? it.at - 0.5 : it.at, to: it.type === "said" ? it.end + 0.5 : it.at + it.dur,
+  format: "wav", ...(dl ? { download: 1 } : {}) });
+const itemTime = it => it.at_time ?? it.at ?? (it.event && it.event.at_time);
 
 // --- list ---------------------------------------------------------------------
 let listReq = 0;
@@ -344,11 +364,19 @@ function renderList() {
         <div><div class="name">${esc(it.name)}</div><div class="meta">${esc(it.folder)}</div></div>
         <div class="right">${e ? `<span class="score">${e.score.toFixed(2)}</span>${dot}` : ""}</div></div>`;
     }
-    const tag = S.view === "preview" && !it.clip_id ? " · not cut yet" : "";
+    if (it.type === "window" || it.type === "said") {
+      const name = it.type === "said" ? `“${esc(it.text)}”` : `${Math.round(it.dur)} s of recording`;
+      const right = it.match != null ? `<span class="score">${it.match.toFixed(2)}</span>` : "";
+      return `<div class="row${i === S.i ? " sel" : ""}" data-i="${i}">
+        <div class="kind">${it.type === "said" ? "said" : "recording"}</div>
+        <div><div class="name">${name}</div><div class="meta">${fmtTime(it.at)}</div></div>
+        <div class="right">${right}</div></div>`;
+    }
+    const tag = (S.view === "preview" || S.view === "search") && !it.clip_id ? " · not cut yet" : "";
     return `<div class="row${i === S.i ? " sel" : ""}" data-i="${i}">
       <div class="kind">${esc(it.kind)}</div>
       <div><div class="name">${esc(it.label)}</div><div class="meta">${fmtTime(it.at_time)} · ${fmtDur(it.duration)}${tag}</div></div>
-      <div class="right"><span class="score">${it.score.toFixed(2)}</span>${dot}</div></div>`;
+      <div class="right"><span class="score">${(it.match ?? it.score).toFixed(2)}</span>${dot}</div></div>`;
   }).join("");
   $("#more").hidden = S.view === "preview" || S.items.length >= S.total;
 }
@@ -366,6 +394,7 @@ function audioURL(it) {
   const e = ev(it);
   if (S.widen && e) return `/api/event/${e.id}/audio?pad=3`;
   if (S.view === "kept") return `/api/kept/file?p=${it.file}`;
+  if (it.type === "window" || it.type === "said") return spanURL(it);
   if (it.clip_id) return `/api/clip/${it.clip_id}/file`;
   return `/api/event/${it.id}/audio?pad=0`;
 }
@@ -375,15 +404,20 @@ async function select(i, play) {
   S.i = i; renderList();
   document.querySelector(`.row[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
   const it = S.items[i], e = ev(it);
-  $("#title").textContent = S.view === "kept" ? it.name : `${e.label} · ${e.kind}`;
-  $("#subtitle").textContent = e ? `${fmtTime(e.at_time)} · score ${e.score.toFixed(2)} · #${e.id}` : it.folder;
-  $("#download").href = S.view === "kept" ? `/api/kept/file?p=${it.file}` : it.clip_id ? `/api/clip/${it.clip_id}/file` : `/api/event/${it.id}/audio`;
-  $("#msg").textContent = ""; $("#feat").innerHTML = ""; $("#said").innerHTML = "";
+  const span = it.type === "window" || it.type === "said";
+  $("#title").textContent = S.view === "kept" ? it.name : span
+    ? (it.type === "said" ? `“${it.text}”` : `${Math.round(it.dur)} s of recording`) : `${e.label} · ${e.kind}`;
+  $("#subtitle").textContent = span ? `${fmtTime(it.at)}${it.match != null ? " · match " + it.match.toFixed(2) : ""}`
+    : e ? `${fmtTime(e.at_time)} · score ${e.score.toFixed(2)} · #${e.id}` : it.folder;
+  $("#download").href = S.view === "kept" ? `/api/kept/file?p=${it.file}` : span ? spanURL(it, true)
+    : it.clip_id ? `/api/clip/${it.clip_id}/file` : `/api/event/${it.id}/audio`;
+  $("#msg").textContent = ""; $("#feat").innerHTML = ""; $("#said").innerHTML = ""; $("#tags").textContent = "";
   updateButtons();
   await loadAudio(play);
   if (e) getJSON(`/api/event/${e.id}`).then(d => {
     if (S.items[S.i] !== it) return;
     $("#said").innerHTML = (d.transcript || []).map(l => `<p>“${esc(l.text)}”</p>`).join("");
+    $("#tags").textContent = (d.tags || []).slice(0, 3).map(([l, p]) => `${l} ${Math.round(p * 100)}%`).join(" · ");
     $("#feat").innerHTML = Object.entries(d.features).map(([k, v]) =>
       `<tr><td>${esc(k.replace(/_/g, " "))}</td><td>${esc(v)}</td></tr>`).join("");
   }).catch(() => {});
@@ -430,6 +464,7 @@ function updateButtons() {
   const it = S.items[S.i], e = it && ev(it);
   $("#prev").disabled = !it || S.i <= 0; $("#next").disabled = !it || S.i >= S.items.length - 1;
   $("#play").disabled = !it; $("#widen").disabled = !e; $("#good").disabled = !e; $("#bad").disabled = !e;
+  $("#totimeline").disabled = !it || itemTime(it) == null;
   $("#widen").classList.toggle("on", S.widen);
   $("#good").classList.toggle("on", !!e && e.rating === 1);
   $("#bad").classList.toggle("on", !!e && e.rating === -1);
@@ -449,6 +484,36 @@ $("#prev").onclick = () => select(S.i - 1, true);
 $("#next").onclick = () => select(S.i + 1, true);
 $("#widen").onclick = () => { S.widen = !S.widen; updateButtons(); loadAudio(true); };
 $("#good").onclick = () => rate(1);
+$("#totimeline").onclick = () => { const it = S.items[S.i]; if (it) openInTimeline(itemTime(it)); };
+async function openInTimeline(t) {
+  if (t == null) return;
+  switchView("timeline");
+  tl.day = dayStart(t * 1000); tl.t = t;
+  await tlLoadDay();
+  tlPlay(t);
+}
+
+// --- search -------------------------------------------------------------------
+$("#searchbar").onsubmit = async e => {
+  e.preventDefault();
+  const q = $("#q").value.trim(); if (!q) return;
+  const mode = $("#qmode").value;
+  $("#listinfo").textContent = "Searching…";
+  try {
+    if (mode === "sound") {
+      const d = await getJSON("/api/search/sound?" + new URLSearchParams({ q }));
+      S.items = d.results.map(r => r.type === "event" ? { ...r, at_time: r.at, duration: r.dur } : r);
+      $("#listinfo").textContent = d.vectors ? `${S.items.length} best match(es) for “${q}”: detected moments and stretches of recording`
+        : "Nothing is searchable yet: moments get search vectors when they're tagged (the nightly run, or analyzer.py tag).";
+    } else {
+      const d = await getJSON("/api/search/text?" + new URLSearchParams({ q }));
+      S.items = d.results.map(r => ({ ...r, type: "said", dur: r.end - r.at }));
+      $("#listinfo").textContent = d.total ? `${S.items.length} line(s) with “${q}”` : "No transcripts yet: they arrive with transcription.";
+    }
+  } catch (err) { S.items = []; $("#listinfo").textContent = err.message; }
+  S.total = S.items.length; S.i = -1; renderList();
+  if (S.items.length) select(0, false); else clearPlayer();
+};
 $("#bad").onclick = () => rate(-1);
 $("#vizwrap").onclick = e => {
   if (!S.buffer) return;
@@ -990,11 +1055,12 @@ function tlKey(e, k) {
 }
 
 // --- views --------------------------------------------------------------------
-const PANES = { browse: ["archive", "staged", "kept", "preview"], timeline: ["timeline"], tuning: ["tuning"] };
+const PANES = { browse: ["archive", "staged", "kept", "preview", "search"], timeline: ["timeline"], tuning: ["tuning"] };
 function showPane(v) {
   const pane = Object.keys(PANES).find(p => PANES[p].includes(v));
   for (const p of Object.keys(PANES)) $("#" + p).style.display = p === pane ? (p === "browse" ? "" : "block") : "none";
-  $("#filters").style.display = pane === "browse" ? "" : "none";
+  $("#filters").style.display = pane === "browse" && v !== "search" ? "" : "none";
+  $("#searchbar").hidden = v !== "search";
   document.body.classList.toggle("split", pane === "browse");
 }
 function showBrowse() { showPane("preview"); }
@@ -1008,6 +1074,11 @@ function switchView(v) {
     return;
   }
   if (v === "timeline") { if (!tl.cover) tlLoadDay(); else tlDraw(); return; }
+  if (v === "search") {
+    S.items = []; S.i = -1; renderList(); clearPlayer();
+    $("#listinfo").textContent = "Describe a sound (“glass clinking”, “low hum”, “someone laughing”), or switch to words said.";
+    $("#q").focus(); return;
+  }
   $("#sort").disabled = $("#kind").disabled = v === "kept";
   loadList(false).catch(e => { $("#listinfo").textContent = e.message; });
 }

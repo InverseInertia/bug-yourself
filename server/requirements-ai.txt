@@ -1,0 +1,4 @@
+# Milestone D (tags and sound search). Installed by: server/install.sh --with-ai
+# The PyPI torch wheel for Linux includes CUDA; only the NVIDIA driver is needed.
+torch>=2.3
+transformers>=4.44

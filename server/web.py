@@ -12,6 +12,7 @@ Endpoints (JSON unless noted):
   GET  /api/timeline/events?from=&to=&all=     clips (and with all=1 every detected moment) in a range
   GET  /api/timeline/transcript?from=&to=      transcript lines in a range
   GET  /api/search/text?q=                     transcript search
+  GET  /api/search/sound?q=                    sounds like a description (CLAP; milestone D)
   GET  /api/run  /  POST /api/run              status of / start an analyzer run
   GET  /api/event/<id>           details, features, rating
   GET  /api/event/<id>/audio?pad=S   WAV cut from the source recording (X-Clip-Start/End: seconds)
@@ -62,6 +63,9 @@ class App:
         self.run_exit = None
         self.durations = {}  # chunk name -> (frames, sr), for the timeline
         self.runpos = {}     # chunk name -> (run, start sample in the run), once analyzed
+        self.models = None   # CLAP text side for searches, loaded on first search
+        self.models_error = None
+        self.vindex = None
         self.lock = threading.Lock()
 
     def db(self):
@@ -85,9 +89,23 @@ def kept_path(token):
 def event_row(r):
     d = dict(r)
     d["duration"] = (d.pop("end_sample") - d.pop("start_sample")) / d.pop("sr")
-    if "features" in d:
-        d["features"] = json.loads(d["features"])
+    for k in ("features", "tags"):
+        if d.get(k):
+            d[k] = json.loads(d[k])
     return d
+
+
+def sound_search(app, text, limit):
+    import ai
+    with app.lock:
+        if app.models is None and app.models_error is None:
+            app.models, app.models_error = ai.load(app.cfg.ai_device, text_only=True)
+            app.vindex = ai.VectorIndex()
+    if app.models is None:
+        raise RuntimeError(f"sound search unavailable: {app.models_error}")
+    with app.db() as db:
+        return {"results": ai.search(db, app.models, text, app.vindex, limit),
+                "vectors": db.execute("SELECT count(*) FROM embeddings").fetchone()[0]}
 
 
 # --- queries ------------------------------------------------------------------
@@ -140,7 +158,7 @@ def list_kept(app, offset, limit):
 def event_details(app, ev_id):
     with app.db() as db:
         r = db.execute(
-            "SELECT e.id, e.session AS run, e.chunk, e.at_time, e.kind, e.label, e.score, e.features, e.status, "
+            "SELECT e.id, e.session AS run, e.chunk, e.at_time, e.kind, e.label, e.score, e.features, e.status, e.tags, "
             "e.start_sample, e.end_sample, e.sr, r.rating, c.id AS clip_id, c.state AS clip_state, c.path AS clip_path "
             "FROM events e LEFT JOIN ratings r ON r.event_id = e.id "
             "LEFT JOIN clips c ON c.event_id = e.id WHERE e.id = ?", (ev_id,)).fetchone()
@@ -588,6 +606,8 @@ class Handler(BaseHTTPRequestHandler):
             with app.db() as db:
                 return self.send(200, {"segments": transcripts.between(db, float(q["from"]), float(q["to"])),
                                        "total": transcripts.count(db)})
+        if path == "/api/search/sound":
+            return self.send(200, sound_search(app, q.get("q", ""), min(200, int(q.get("limit", 60)))))
         if path == "/api/search/text":
             with app.db() as db:
                 return self.send(200, {"results": transcripts.search(db, q.get("q", ""), int(q.get("limit", 100))),

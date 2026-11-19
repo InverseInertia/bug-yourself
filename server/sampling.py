@@ -79,6 +79,8 @@ def detect_chunk(db, locate, name, path):
     events = detect.analyze(buf, sr, own_from, own_to)
     r_epoch = run_epoch(run)
     now = time.time()
+    db.execute("DELETE FROM embeddings WHERE ref_event IN "
+               "(SELECT id FROM events WHERE chunk=? AND status='candidate')", (name,))
     db.execute("DELETE FROM events WHERE chunk=? AND status='candidate'", (name,))
     for ev in events:
         # Plain ints/floats: numpy scalars would be stored by sqlite as blobs.
@@ -89,8 +91,9 @@ def detect_chunk(db, locate, name, path):
             "features, status, detect_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (run, name, s, e, int(sr), r_epoch + s / sr, ev.kind, float(ev.score), ev.label,
              json.dumps(ev.features), "candidate", detect.VERSION, now))
-    db.execute("UPDATE chunks SET session=?, seq=?, start_sample=?, frames=?, sr=?, detect_version=? WHERE name=?",
-               (run, seq, int(start), int(frames), int(sr), detect.VERSION, name))
+    # New candidates have no tags yet: mark the chunk for the tagging step.
+    db.execute("UPDATE chunks SET session=?, seq=?, start_sample=?, frames=?, sr=?, detect_version=?, ai_version=NULL "
+               "WHERE name=?", (run, seq, int(start), int(frames), int(sr), detect.VERSION, name))
     return len(events)
 
 
@@ -194,3 +197,73 @@ def select_and_cut(db, locate, samples_new_dir, quota, min_score, since):
         db.commit()
         cut += 1
     return cut, failed
+
+
+# --- tags and search vectors (milestone D) -------------------------------------------
+
+QUIET_WINDOW_DB = -55.0  # windows quieter than this (an empty room) aren't worth searching
+
+
+def slug(text, default="untagged"):
+    import re
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:40]
+    return s or default
+
+
+def tagged_label(kind, base, tag):
+    """Clip name stem once the tagger has spoken: the tag, plus the note or tempo."""
+    if kind in ("tonal", "loop"):
+        return f"{slug(tag)}-{base}"
+    return slug(tag)
+
+
+def ai_chunk(db, models, locate, name):
+    """Tag and embed one analyzed chunk's moments, and embed its audible 10 s windows."""
+    import ai
+    row = db.execute("SELECT session, start_sample, frames, sr FROM chunks WHERE name=?", (name,)).fetchone()
+    if not row or row[1] is None:
+        return 0, 0
+    run, start, frames, sr = row
+    end = start + frames
+    model = ai.embed_name(models)
+    r_epoch = run_epoch(run)
+
+    evs = db.execute("SELECT id, start_sample, end_sample, kind, label, base_label, status FROM events "
+                     "WHERE chunk=? AND tags IS NULL", (name,)).fetchall()
+    clips, keep = [], []
+    for ev in evs:
+        a = ev[1]
+        b = min(ev[2], a + int(ai.MAX_CLIP_S * sr), end)  # this chunk's part; the next may not be analyzed yet
+        if b > a:
+            clips.append(read_session_range(db, locate, run, a, b)[0])
+            keep.append((ev, a, b))
+    if clips:
+        tags, vecs = models.tag(clips), models.embed_audio(clips)
+        for (ev, a, b), t, v in zip(keep, tags, vecs):
+            ev_id, _, _, kind, label, base, status = ev
+            base = base or label
+            tag = ai.pick_tag(t)
+            # Clips already cut keep their file name; candidates take the tag in theirs.
+            new_label = label if status == "proposed" or kind == "manual" else tagged_label(kind, base, tag)
+            db.execute("UPDATE events SET tags=?, tag=?, base_label=?, label=? WHERE id=?",
+                       (json.dumps(t), tag, base, new_label, ev_id))
+            db.execute("DELETE FROM embeddings WHERE ref_event=?", (ev_id,))
+            ai.store_vector(db, v, model, run, name, a, b, sr, r_epoch + a / sr, ref_event=ev_id)
+
+    db.execute("DELETE FROM embeddings WHERE chunk=? AND ref_event IS NULL", (name,))
+    w = int(ai.WINDOW_S * sr)
+    windows, spans = [], []
+    for a in range(start, end, w):
+        b = min(end, a + w)
+        if b - a < 3 * sr:
+            continue
+        x = read_session_range(db, locate, run, a, b)[0]
+        if 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-10) < QUIET_WINDOW_DB:
+            continue
+        windows.append(x)
+        spans.append((a, b))
+    if windows:
+        for (a, b), v in zip(spans, models.embed_audio(windows)):
+            ai.store_vector(db, v, model, run, name, a, b, sr, r_epoch + a / sr)
+    db.execute("UPDATE chunks SET ai_version=? WHERE name=?", (ai.VERSION, name))
+    return len(keep), len(windows)

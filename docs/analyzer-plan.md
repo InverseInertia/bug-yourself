@@ -1,6 +1,6 @@
 # Analyzer plan
 
-Status: milestones A, B and C built (`server/analyzer.py`, `detect.py`, `sampling.py`, `web.py`); D onwards planned. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
+Status: milestones A–D built (`server/analyzer.py`, `detect.py`, `sampling.py`, `web.py`, `ai.py`); E (transcription) planned, with storage and display already in place. Target machine: Bazzite (NVIDIA image), RTX 3080, SSD + HDD.
 
 The analyzer runs once a night. It finds points of interest for sampling in recordings that haven't been analyzed yet, writes them to a searchable index, cuts clips into a samples library, and moves the audio into the HDD archive.
 
@@ -151,10 +151,25 @@ Each milestone is useful on its own:
 | A (built) | nightly timer, migration to HDD, archive and samples pruning, chunk state DB | no |
 | B (built) | tonal / percussive / loop / texture detection, clip cutting, `list`, `cut`, `reanalyze` | no |
 | C (built) | review web app: proposed/kept pages, click-through player, widen, ratings, Tuning page | no |
-| D | AudioSet tags in clip names, CLAP search (CLI and web) | yes |
+| D (built) | AudioSet tags in clip names, CLAP search (CLI and web) | yes |
 | E | VAD + Whisper transcripts, transcript search (CLI and web) | yes |
 
 Milestone A comes first because, without it, `unanalyzed/` on the HDD grows by about 2.4 GB a day with nothing archiving or pruning it. The web app comes right after detection, because detection can only be tuned by listening to what it proposes.
+
+## Tags and sound search (milestone D, as built)
+
+`server/ai.py` loads two Hugging Face models on first use: `MIT/ast-finetuned-audioset-10-10-0.4593` (AudioSet tags) and `laion/clap-htsat-unfused` (CLAP). They run on the GPU when it has 2.5 GB free, else on the CPU (`[ai] device`). The tagging step runs per chunk right after detection, so the night's clips are named by their tag:
+- The best specific AudioSet label is used; generic ones like "Music", "Speech" and "Inside, small room" are passed over.
+- Tonal clips keep their note and loops their tempo, e.g. `glass-E4`, `drum-120bpm`.
+- Clips already cut keep their file names.
+
+Every detected moment gets a CLAP vector, and so does every audible 10 s window of the recordings. Windows below −55 dBFS, an empty room, are skipped; this keeps the database from growing about 1 GB a month with nothing in it. Window vectors are deleted along with their audio when the archive is pruned.
+
+Search embeds the description with CLAP's text side and ranks every stored vector by cosine similarity, brute force in numpy. It's available as `analyzer.py search`, as `/api/search/sound`, and on the review app's Search tab.
+
+Tagging never fails a chunk: if the models can't load, chunks are archived untagged, and `analyzer.py tag` adds tags and vectors later (`--all` re-tags everything). `reanalyze` tags as it goes.
+
+Tested with a stand-in (`BUG_AI_FAKE=1`) through the whole pipeline: tags, labels, vectors, search, reanalysis and backfill, the CLI and the web UI. The real models couldn't be downloaded in the development environment, so their first real run is on the PC. The model code handles both the newer and older transformers call styles for CLAP.
 
 ## Transcripts: what's already in place
 

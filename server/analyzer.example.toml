@@ -26,3 +26,11 @@ samples_max = "100GB"
 # database either way (analyzer.py list --all), so these can be changed later.
 quota_per_hour = { percussive = 6, tonal = 4, loop = 2, texture = 2 }
 min_score = { percussive = 0.75, tonal = 0.6, loop = 0.6, texture = 0.6 }
+
+[ai]
+# Tags (what a sound is) and search vectors (find sounds by describing them).
+# Needs server/install.sh --with-ai; without it, moments are simply untagged.
+# device: "auto" uses the GPU when at least 2.5 GB of its memory is free (so a
+# running game isn't disturbed), else the CPU; or force "cuda" / "cpu".
+enabled = true
+device = "auto"

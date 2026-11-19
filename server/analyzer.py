@@ -8,6 +8,8 @@
     analyzer.py reanalyze  [--prefix 20261117] [--since 7d]
     analyzer.py web        [--bind IP] [--port 8676]   the review app (token: BUG_TOKEN)
     analyzer.py find-text  "words"                   search transcripts (once transcription exists)
+    analyzer.py search     "metallic ring"           find sounds by describing them (milestone D)
+    analyzer.py tag        [--prefix 20261117]        add tags and search vectors to analyzed chunks
     (all take --config FILE)
 
 Each run finds unanalyzed chunks on the SSD working folder and in the HDD
@@ -63,6 +65,8 @@ class Config:
     quota: dict           # clips per hour, per kind
     min_score: dict       # minimum score to become a clip, per kind
     kept_dirs: list       # where you move keepers; browsable in the web app
+    ai_enabled: bool      # tag moments and make search vectors (needs torch + transformers)
+    ai_device: str        # auto | cuda | cpu
     path: Path = None     # the config file, so the web app can save tuning changes
 
     @property
@@ -90,6 +94,8 @@ def load_config(path):
             quota={**DEFAULT_QUOTA, **raw.get("detect", {}).get("quota_per_hour", {})},
             min_score={**DEFAULT_MIN_SCORE, **raw.get("detect", {}).get("min_score", {})},
             kept_dirs=[Path(d).expanduser() for d in raw.get("kept_dirs", [])],
+            ai_enabled=bool(raw.get("ai", {}).get("enabled", True)),
+            ai_device=str(raw.get("ai", {}).get("device", "auto")),
             path=Path(path),
         )
     except KeyError as e:
@@ -136,6 +142,21 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_by_chunk ON events(chunk);
 CREATE INDEX IF NOT EXISTS events_by_time ON events(at_time);
+CREATE TABLE IF NOT EXISTS embeddings (
+    id            INTEGER PRIMARY KEY,
+    ref_event     INTEGER,             -- the detected moment it describes, or NULL for a 10 s window
+    run           TEXT NOT NULL,
+    chunk         TEXT NOT NULL,
+    start_sample  INTEGER NOT NULL,
+    end_sample    INTEGER NOT NULL,
+    sr            INTEGER NOT NULL,
+    at_time       REAL NOT NULL,
+    dur           REAL NOT NULL,
+    vector        BLOB NOT NULL,       -- float16, unit length
+    model         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS embeddings_by_chunk ON embeddings(chunk);
+CREATE INDEX IF NOT EXISTS embeddings_by_event ON embeddings(ref_event);
 CREATE TABLE IF NOT EXISTS ratings (
     event_id  INTEGER PRIMARY KEY,      -- your verdict on a detected moment, for tuning
     rating    INTEGER NOT NULL,         -- 1 = good, -1 = bad
@@ -143,7 +164,11 @@ CREATE TABLE IF NOT EXISTS ratings (
 );
 """
 # Columns added after milestone A; existing databases get them on open.
-CHUNK_COLUMNS = {"start_sample": "INTEGER", "frames": "INTEGER", "sr": "INTEGER", "detect_version": "INTEGER"}
+CHUNK_COLUMNS = {"start_sample": "INTEGER", "frames": "INTEGER", "sr": "INTEGER", "detect_version": "INTEGER",
+                 "ai_version": "INTEGER"}
+EVENT_COLUMNS = {"tags": "TEXT",        # JSON [[AudioSet label, probability], ...] (milestone D)
+                 "tag": "TEXT",         # the label the clip is named by
+                 "base_label": "TEXT"}  # the detector's own label (note, tempo) before tagging
 
 
 def open_db(path, dry=False):
@@ -163,6 +188,10 @@ def open_db(path, dry=False):
     for col, typ in CHUNK_COLUMNS.items():
         if col not in have:
             db.execute(f"ALTER TABLE chunks ADD COLUMN {col} {typ}")
+    have = {row[1] for row in db.execute("PRAGMA table_info(events)")}
+    for col, typ in EVENT_COLUMNS.items():
+        if col not in have:
+            db.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
     return db
 
 
@@ -248,9 +277,35 @@ class Run:
         if self.sampling is None:
             log(f"WARNING: detection unavailable ({why}). Chunks stay in 'unanalyzed' until it's "
                 f"installed (server/install.sh does this).")
-        stages = [lambda db, path: self.sampling.detect_chunk(db, self.locate_any, path.name, path)] \
-            if self.sampling else []
+        stages = [lambda db, path: self.sampling.detect_chunk(db, self.locate_any, path.name, path),
+                  lambda db, path: self.ai_stage(db, path.name)] if self.sampling else []
         self.stages = stages + STAGES
+        self._models = None  # loaded on first use: it takes a while and a GB of (V)RAM
+
+    def models(self):
+        """The tagging/search models, or None. Loaded once per run."""
+        if self._models is None:
+            self._models = False
+            if self.cfg.ai_enabled and self.sampling:
+                import ai
+                m, why = ai.load(self.cfg.ai_device)
+                if m:
+                    log(f"tagging with {m.name} on {m.device}")
+                    self._models = m
+                else:
+                    log(f"tagging unavailable ({why}); moments stay untagged until `analyzer.py tag`")
+        return self._models or None
+
+    def ai_stage(self, db, name):
+        """Tags and search vectors. Never fails the chunk: without them it's simply
+        archived untagged, and `analyzer.py tag` catches up later."""
+        m = self.models()
+        if not m:
+            return
+        try:
+            self.sampling.ai_chunk(db, m, self.locate_any, name)
+        except Exception as e:
+            log(f"tagging {name} failed: {type(e).__name__}: {e}")
         # Dry run: files that a real run would have added, so the pruning forecast is right.
         self.would_archive = []  # (name, size)
         self.would_add_samples = []  # (sort key, size)
@@ -353,6 +408,8 @@ class Run:
             if not self.dry:
                 p.unlink()
                 self.db.execute("UPDATE chunks SET location='pruned', pruned_at=? WHERE name=?", (time.time(), p.name))
+                # Windows of audio that's gone can't be played; moments keep theirs (clips may survive).
+                self.db.execute("DELETE FROM embeddings WHERE chunk=? AND ref_event IS NULL", (p.name,))
             total -= size
             removed += 1
         if not self.dry:
@@ -557,6 +614,12 @@ def cmd_status(cfg, args):
     n = transcripts.count(db)
     if n:
         log(f"transcript segments: {n}")
+    tagged, vecs = db.execute("SELECT (SELECT count(*) FROM events WHERE tags IS NOT NULL), "
+                              "(SELECT count(*) FROM embeddings)").fetchone()
+    waiting = db.execute("SELECT count(*) FROM chunks WHERE detect_version IS NOT NULL AND ai_version IS NULL "
+                         "AND location != 'pruned'").fetchone()[0]
+    if tagged or vecs or waiting:
+        log(f"tagged moments: {tagged}, search vectors: {vecs}, chunks waiting for tags: {waiting}")
     if load_sampling()[0] is None:
         log(f"WARNING: detection unavailable: {load_sampling()[1]}")
 
@@ -640,6 +703,7 @@ def cmd_reanalyze(cfg, args):
             path = run.locate_any(name)
             try:
                 run.sampling.detect_chunk(db, run.locate_any, name, path)
+                run.ai_stage(db, name)
                 db.execute("UPDATE chunks SET state='analyzed', last_error=NULL WHERE name=?", (name,))
             except Exception as e:  # keep going; report at the end
                 failed += 1
@@ -673,6 +737,55 @@ def cmd_find_text(cfg, args):
         log(f"{when}  ({h['end'] - h['at']:4.1f}s)  {h['text']}")
     if not hits:
         log("nothing matches")
+
+
+def cmd_tag(cfg, args):
+    """Add tags and search vectors to chunks analyzed without them."""
+    check_hdd(cfg)
+    with run_lock(cfg):
+        db = open_db(cfg.db_path)
+        run = Run(cfg, db, dry=False)
+        if not run.models():
+            sys.exit("tagging unavailable (see above)")
+        where = ["detect_version IS NOT NULL", "location != 'pruned'"]
+        params = []
+        if not args.all:
+            where.append("ai_version IS NULL")
+        if args.prefix:
+            where.append("name LIKE ?")
+            params.append(args.prefix + "%")
+        names = [r[0] for r in db.execute(f"SELECT name FROM chunks WHERE {' AND '.join(where)} ORDER BY name", params)]
+        if args.all:  # re-tag everything: forget the old tags first
+            for name in names:
+                db.execute("UPDATE events SET tags=NULL WHERE chunk=?", (name,))
+        moments = windows = 0
+        for i, name in enumerate(names, 1):
+            try:
+                m, w = run.sampling.ai_chunk(db, run.models(), run.locate_any, name)
+                moments, windows = moments + m, windows + w
+            except Exception as e:
+                log(f"{name}: {type(e).__name__}: {e}")
+            db.commit()
+            if i % 50 == 0:
+                log(f"  {i}/{len(names)} chunks")
+        log(f"tagged {moments} moment(s) and embedded {windows} window(s) in {len(names)} chunk(s)")
+
+
+def cmd_search(cfg, args):
+    check_hdd(cfg)
+    import ai
+    models, why = ai.load(cfg.ai_device, text_only=True)
+    if not models:
+        sys.exit(f"search unavailable: {why}")
+    db = open_db(cfg.db_path)
+    hits = ai.search(db, models, " ".join(args.words), limit=args.limit)
+    for h in hits:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["at"]))
+        what = f"{h['kind']:<10} {h['label']}" + (" (clip)" if h.get("clip_id") else "") \
+            if h["type"] == "event" else f"{'recording':<10} {h['dur']:.0f} s stretch"
+        log(f"{h['match']:.3f}  {when}  {what}")
+    if not hits:
+        log("nothing found (nothing has been tagged yet?)")
 
 
 def cmd_web(cfg, args):
@@ -711,6 +824,14 @@ def main():
     ft.add_argument("words", nargs="+")
     ft.add_argument("--limit", type=int, default=50)
     ft.set_defaults(fn=cmd_find_text)
+    tg = sub.add_parser("tag", help="add tags and search vectors to analyzed chunks that lack them")
+    tg.add_argument("--prefix", help="only chunks whose name begins with this, e.g. 20261117")
+    tg.add_argument("--all", action="store_true", help="re-tag chunks that already have tags too")
+    tg.set_defaults(fn=cmd_tag)
+    se = sub.add_parser("search", help="find sounds by describing them")
+    se.add_argument("words", nargs="+")
+    se.add_argument("--limit", type=int, default=30)
+    se.set_defaults(fn=cmd_search)
     w = sub.add_parser("web", help="the review app: browse, rate and tune in a browser")
     w.add_argument("--bind", default="127.0.0.1", help="your Tailscale IP to reach it from the phone")
     w.add_argument("--port", type=int, default=8676)

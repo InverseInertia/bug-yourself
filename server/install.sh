@@ -25,12 +25,15 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-Usage: server/install.sh [--update | --reconfigure | --uninstall]
+Usage: server/install.sh [--update | --reconfigure | --uninstall] [--with-ai | --no-ai]
 
   (no option)    install, or reinstall after you've pulled new code
   --update       git pull, then reinstall and restart the receiver
   --reconfigure  ask the setup questions again (current values are the defaults)
   --uninstall    stop and remove the services; settings and recordings are kept
+  --with-ai      also install tagging and sound search (PyTorch + transformers,
+                 about 3 GB; the models download ~1 GB more on first use).
+                 Remembered: later updates keep it. --no-ai turns it off again.
 EOF
 }
 
@@ -226,6 +229,15 @@ setup_venv() {
         warn "installing the analyzer's requirements failed; detection waits until this works"
         return 1
     fi
+    if [[ ${WITH_AI:-0} == 1 ]]; then
+        say "  tagging and sound search: installing PyTorch and transformers (about 3 GB the first time)..."
+        if "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
+                -r "$REPO/server/requirements-ai.txt"; then
+            say "  torch, transformers: ok (the models download on first use, ~1 GB)"
+        else
+            warn "installing torch/transformers failed; moments stay untagged until it works"
+        fi
+    fi
 }
 
 # --- services -----------------------------------------------------------------
@@ -243,7 +255,15 @@ render() {  # render <template> <python command> <dest>
     fi
 }
 
+remember_ai_choice() {
+    [[ -z $ai_choice ]] && return 0
+    grep -v '^WITH_AI=' "$INSTALL_CONF" > "$INSTALL_CONF.tmp" || true
+    printf 'WITH_AI="%s"\n' "$ai_choice" >> "$INSTALL_CONF.tmp"
+    mv "$INSTALL_CONF.tmp" "$INSTALL_CONF"
+}
+
 install_services() {
+    remember_ai_choice
     # shellcheck disable=SC1090
     . "$INSTALL_CONF"
     # Without the venv the analyzer still archives and prunes; chunks just wait for detection.
@@ -308,14 +328,18 @@ uninstall() {
 # --- main ---------------------------------------------------------------------
 
 mode=install
-case ${1-} in
-    "") ;;
-    --update) mode=update ;;
-    --reconfigure) mode=reconfigure ;;
-    --uninstall) mode=uninstall ;;
-    -h|--help) usage; exit 0 ;;
-    *) usage >&2; exit 2 ;;
-esac
+ai_choice=""
+for arg in "$@"; do
+    case $arg in
+        --update) mode=update ;;
+        --reconfigure) mode=reconfigure ;;
+        --uninstall) mode=uninstall ;;
+        --with-ai) ai_choice=1 ;;
+        --no-ai) ai_choice=0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
 
 command -v systemctl >/dev/null || die "systemctl not found"
 
@@ -328,7 +352,7 @@ if [[ $mode == update ]]; then
     say "== Pulling the latest code"
     git -C "$REPO" pull --ff-only
     # The pull may have changed this very script; continue in the new version.
-    exec "$REPO/server/install.sh"
+    exec "$REPO/server/install.sh" ${ai_choice:+$([[ $ai_choice == 1 ]] && echo --with-ai || echo --no-ai)}
 fi
 
 check_python
