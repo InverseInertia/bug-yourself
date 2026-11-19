@@ -41,7 +41,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import transcripts  # noqa: E402
 
-KINDS = ["percussive", "tonal", "loop", "texture"]
+KINDS = ["percussive", "tonal", "loop", "texture"]  # detected kinds; "manual" clips are made by you
 AUDIO_EXT = {".flac", ".wav", ".ogg", ".mp3", ".aif", ".aiff", ".m4a"}
 CLIP_NAME_RE = re.compile(r"^.+_\d{8}_(?P<event>\d+)(?:_pad[\d.]+)?\.flac$")
 INDEX = Path(__file__).resolve().parent / "web" / "index.html"
@@ -61,6 +61,7 @@ class App:
         self.run_started = self.run_ended = None
         self.run_exit = None
         self.durations = {}  # chunk name -> (frames, sr), for the timeline
+        self.runpos = {}     # chunk name -> (run, start sample in the run), once analyzed
         self.lock = threading.Lock()
 
     def db(self):
@@ -307,16 +308,19 @@ MAX_CHUNK_S = 3600  # longest chunk to expect; chunks starting this early can re
 
 
 def chunk_durations(app, names):
-    """(frames, sr) per chunk: from the DB when analyzed, else from the file's headers."""
-    need = [n for n in names if n not in app.durations]
+    """(frames, sr) per chunk: from the DB when analyzed, else from the file's headers.
+    Also notes each analyzed chunk's run and position in it (app.runpos)."""
+    need = [n for n in names if n not in app.durations or n not in app.runpos]
     if need:
         with app.db() as db:
             for i in range(0, len(need), 500):
                 part = need[i:i + 500]
-                for name, frames, sr in db.execute(
-                        f"SELECT name, frames, sr FROM chunks WHERE frames IS NOT NULL AND name IN "
-                        f"({','.join('?' * len(part))})", part):
+                for name, frames, sr, run, start in db.execute(
+                        f"SELECT name, frames, sr, session, start_sample FROM chunks WHERE frames IS NOT NULL "
+                        f"AND name IN ({','.join('?' * len(part))})", part):
                     app.durations[name] = (frames, sr)
+                    if start is not None:
+                        app.runpos[name] = (run, start)
     return app.durations
 
 
@@ -353,11 +357,104 @@ def timeline_segments(app, t0, t1):
             last["chunks"].append((name, path, epoch, frames, last["frames"]))
             last["frames"] += frames
         else:
-            segs.append({"start": float(epoch), "sr": sr, "frames": frames,
+            # Time the stretch the same way detected moments are timed (run start +
+            # position), so markers, captions and clips made here line up exactly.
+            start = float(epoch)
+            if name in app.runpos:
+                run, pos = app.runpos[name]
+                run_start = chunk_epoch(run + ".ogg")
+                if run_start is not None:
+                    start = run_start + pos / sr
+            segs.append({"start": start, "sr": sr, "frames": frames,
                          "chunks": [(name, path, epoch, frames, 0)]})
     for s in segs:
         s["end"] = s["start"] + s["frames"] / s["sr"]
     return [s for s in segs if s["end"] > t0]
+
+
+MAX_DOWNLOAD_S = 30 * 60
+MAX_CLIP_S = 5 * 60
+
+
+def range_audio(app, t0, t1):
+    """Samples for wall-clock [t0, t1), which must lie within one continuous recording.
+    Returns (audio, sr, segment, first sample's index within the segment)."""
+    if app.sampling is None:
+        raise RuntimeError(f"audio unavailable: {app.sampling_error}")
+    if not t1 > t0:
+        raise ValueError("the end must come after the start")
+    seg = next((s for s in timeline_segments(app, t0, t1) if s["start"] - 0.01 <= t0 < s["end"]), None)
+    if seg is None:
+        raise ValueError("nothing was recording at the start of the selection")
+    if t1 > seg["end"] + 0.01:
+        raise ValueError("the selection runs past the end of the recording (into a gap)")
+    sr = seg["sr"]
+    a = max(0, int(round((t0 - seg["start"]) * sr)))
+    b = min(seg["frames"], int(round((t1 - seg["start"]) * sr)))
+    import numpy as np
+    pieces = []
+    for name, path, _, frames, off in seg["chunks"]:
+        lo, hi = max(a, off), min(b, off + frames)
+        if lo < hi:
+            pieces.append(app.sampling.read_mono(path, lo - off, hi - off)[0])
+    return (np.concatenate(pieces) if pieces else np.zeros(0, np.float32)), sr, seg, a
+
+
+def encode_audio(x, sr, fmt):
+    import numpy as np
+    import soundfile as sf
+    peak = float(np.max(np.abs(x))) if len(x) else 0.0
+    if peak > 1.0:
+        x = x * (0.999 / peak)
+    buf = io.BytesIO()
+    if fmt == "flac":
+        sf.write(buf, x, sr, format="FLAC", subtype="PCM_24")
+        return buf.getvalue(), "audio/flac"
+    sf.write(buf, x, sr, format="WAV", subtype="PCM_24" if fmt == "wav24" else "PCM_16")
+    return buf.getvalue(), "audio/wav"
+
+
+def timeline_cut(app, t0, t1, fmt):
+    if t1 - t0 > MAX_DOWNLOAD_S:
+        raise ValueError(f"downloads are limited to {MAX_DOWNLOAD_S // 60} minutes")
+    x, sr, _, _ = range_audio(app, t0, t1)
+    data, ctype = encode_audio(x, sr, fmt)
+    stamp = time.strftime("%Y-%m-%d_%H%M%S", time.localtime(t0))
+    ext = "flac" if fmt == "flac" else "wav"
+    return data, ctype, f"bug-yourself_{stamp}.{ext}"
+
+
+def slug(text, default="clip"):
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:40]
+    return s or default
+
+
+def timeline_make_clip(app, t0, t1, label):
+    """Save a selection as a clip of kind 'manual': it's staged like the nightly
+    clips, shows in Staged and Archive, and follows the same storage rules."""
+    if t1 - t0 > MAX_CLIP_S:
+        raise ValueError(f"clips are limited to {MAX_CLIP_S // 60} minutes; use Download for longer stretches")
+    _, sr, seg, a = range_audio(app, t0, t1)
+    b = a + int(round((t1 - t0) * sr))
+    name, _, _, _, off = next(c for c in seg["chunks"] if c[4] <= a < c[4] + c[3])
+    if name not in app.runpos:
+        raise ValueError("this part hasn't been analyzed yet; press Run analyzer first, then make the clip")
+    run, chunk_start = app.runpos[name]
+    from names import chunk_epoch
+    s = chunk_start + (a - off)
+    e = s + (b - a)
+    at = chunk_epoch(run + ".ogg") + s / sr
+    with app.db() as db:
+        cur = db.execute(
+            "INSERT INTO events(session, chunk, start_sample, end_sample, sr, at_time, kind, score, label, features, "
+            "status, detect_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run, name, s, e, sr, at, "manual", 1.0, slug(label), json.dumps({"made_in": "timeline"}),
+             "proposed", 0, time.time()))
+        ev_id = cur.lastrowid
+        dest = app.sampling.cut_event(db, app.locate, ev_id, app.cfg.samples_new_dir / "manual")
+        db.execute("INSERT INTO clips(path, cut_at, state, event_id) VALUES (?,?,?,?)",
+                   (str(dest), time.time(), "new", ev_id))
+    return {"id": ev_id, "name": dest.name, "at": at, "dur": (e - s) / sr}
 
 
 def timeline_coverage(app, t0, t1):
@@ -480,6 +577,13 @@ class Handler(BaseHTTPRequestHandler):
             if t1 - t0 > 8 * 86400:
                 raise ValueError("ask for at most 8 days at a time")
             return self.send(200, timeline_events(app, t0, t1, q.get("all") == "1"))
+        if path == "/api/timeline/cut":
+            fmt = q.get("format", "wav")
+            if fmt not in ("wav", "wav24", "flac"):
+                raise ValueError("format must be wav, wav24 or flac")
+            data, ctype, fname = timeline_cut(app, float(q["from"]), float(q["to"]), fmt)
+            disp = "attachment" if q.get("download") == "1" else "inline"
+            return self.send(200, data, ctype, {"Content-Disposition": f'{disp}; filename="{fname}"'})
         if path == "/api/timeline/transcript":
             with app.db() as db:
                 return self.send(200, {"segments": transcripts.between(db, float(q["from"]), float(q["to"])),
@@ -550,6 +654,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/run":
                 start_run(self.app)
                 return self.send(200, run_status(self.app))
+            if url.path == "/api/timeline/clip":
+                return self.send(200, timeline_make_clip(self.app, float(body["from"]), float(body["to"]),
+                                                         body.get("label", "")))
             raise KeyError(url.path)
         except KeyError:
             return self.send(404, {"error": "not found"})

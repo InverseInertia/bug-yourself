@@ -8,7 +8,7 @@
 :root {
   --bg: #15171c; --panel: #1d2027; --panel2: #252933; --line: #343947; --text: #e7e8ec; --dim: #9aa0ad;
   --accent: #5b8cff; --good: #3fbf7f; --bad: #e5534b; --wave: #8fb3ff; --shade: rgba(91,140,255,.16);
-  --k-percussive: #f0a03c; --k-tonal: #b07cff; --k-loop: #44c98a; --k-texture: #e06fa8; --cover: #5b8cff55;
+  --k-percussive: #f0a03c; --k-tonal: #b07cff; --k-loop: #44c98a; --k-texture: #e06fa8; --k-manual: #d9b53a; --cover: #5b8cff55;
 }
 @media (prefers-color-scheme: light) {
   :root { --bg: #f4f5f8; --panel: #fff; --panel2: #eef0f5; --line: #d9dce5; --text: #1d2027; --dim: #5f6675;
@@ -82,6 +82,11 @@ details.more summary { cursor: pointer; color: var(--dim); font-size: 13px; marg
 #tllines .line:hover { background: var(--panel2); }
 #tllines .line.now { background: var(--shade); }
 #tllines .line time { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 2px; }
+.selinfo { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; font-size: 13px; color: var(--dim); margin: 10px 0 0; }
+.selinfo b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.selinfo button { width: 26px; height: 24px; padding: 0; margin-left: 2px; border-radius: 6px; border: 1px solid var(--line);
+                  background: var(--panel2); color: var(--text); cursor: pointer; font: inherit; }
+.controls select { flex: 0 0 auto; }
 #said { margin-top: 10px; font-size: 14px; }
 #said p { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line); }
 #title { font-size: 18px; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
@@ -152,7 +157,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
   </div>
   <div class="filters" id="filters">
     <select id="kind" aria-label="Kind">
-      <option value="">All kinds</option><option>percussive</option><option>tonal</option><option>loop</option><option>texture</option>
+      <option value="">All kinds</option><option>percussive</option><option>tonal</option><option>loop</option><option>texture</option><option value="manual">made by you</option>
     </select>
     <select id="sort" aria-label="Sort"><option value="time">Newest first</option><option value="score">Best first</option></select>
   </div>
@@ -206,6 +211,7 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
       <span><i style="background:var(--cover)"></i>recorded</span>
       <span><i style="background:var(--k-percussive)"></i>hit</span><span><i style="background:var(--k-tonal)"></i>tonal</span>
       <span><i style="background:var(--k-loop)"></i>loop</span><span><i style="background:var(--k-texture)"></i>texture</span>
+      <span><i style="background:var(--k-manual)"></i>made by you</span><span><i style="background:var(--shade);outline:1px solid var(--accent)"></i>selection</span>
       <span>solid = clip, faint = detected only (zoomed bar)</span>
     </div>
     <div class="controls">
@@ -220,6 +226,23 @@ table.feat td { padding: 3px 0; border-top: 1px solid var(--line); } table.feat 
     <div class="controls">
       <button id="tlprevclip" title="Previous clip (P)">◂ Clip</button>
       <button id="tlnextclip" title="Next clip (N)">Clip ▸</button>
+    </div>
+    <div class="selinfo" id="selinfo">
+      <span>Selection start <b id="selA">–</b><button data-nudge="a,-1" title="Earlier (shift: 0.5 s)">−</button><button data-nudge="a,1" title="Later (shift: 0.5 s)">+</button></span>
+      <span>end <b id="selB">–</b><button data-nudge="b,-1" title="Earlier (shift: 0.5 s)">−</button><button data-nudge="b,1" title="Later (shift: 0.5 s)">+</button></span>
+      <span id="seldur"></span>
+    </div>
+    <div class="controls">
+      <button id="selstart" title="Start the selection at the playhead ([)">[ Start</button>
+      <button id="selend" title="End the selection at the playhead (])">End ]</button>
+      <button id="selmoment" title="Select the moment under the playhead">Select moment</button>
+      <button id="selclear" title="Clear the selection (Esc)">Clear</button>
+    </div>
+    <div class="controls">
+      <button id="selplay" title="Play just the selection">Play selection</button>
+      <select id="dlfmt" aria-label="Download format"><option value="flac">FLAC</option><option value="wav24">WAV 24-bit</option><option value="wav">WAV 16-bit</option></select>
+      <button id="seldl">Download</button>
+      <button id="selclip" title="Save the selection as a clip; it shows up in Staged">Make clip</button>
     </div>
     <div id="tlnote"></div>
     <p class="hint">Plays the recordings as one continuous stream in this device's local time, straight across chunk
@@ -277,11 +300,14 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;",
 function ev(item) { return S.view === "kept" ? item.event : item; }
 
 // --- list ---------------------------------------------------------------------
+let listReq = 0;
 async function loadList(append) {
-  if (!append) { S.items = []; S.i = -1; }
+  const req = ++listReq;  // only the newest load may fill the list
   const q = new URLSearchParams({ view: S.view, kind: $("#kind").value, sort: $("#sort").value,
-                                  offset: S.items.length, limit: 100 });
+                                  offset: append ? S.items.length : 0, limit: 100 });
   const data = await getJSON("/api/clips?" + q);
+  if (req !== listReq) return;
+  if (!append) { S.items = []; S.i = -1; }
   S.items = S.items.concat(data.items); S.total = data.total;
   if (S.view === "kept") {
     $("#listinfo").textContent = data.dirs.length
@@ -637,7 +663,7 @@ document.addEventListener("click", e => { if (!e.target.closest("#runlog, #runst
 // --- timeline -------------------------------------------------------------------
 // Plays recordings as one stream: fetches ~15 s pieces ahead of the playhead and
 // schedules each to start exactly where the previous one ends.
-const tl = { dayEvents: [], near: null, nearBusy: false, linesKey: "", nowLine: null, day: null, cover: null, t: null, playing: false, gen: 0, queue: [], next: null, ahead: 0, fetching: false, ended: false };
+const tl = { sel: { a: null, b: null }, stopAt: null, dayEvents: [], near: null, nearBusy: false, linesKey: "", nowLine: null, day: null, cover: null, t: null, playing: false, gen: 0, queue: [], next: null, ahead: 0, fetching: false, ended: false };
 const pad2 = n => String(n).padStart(2, "0");
 function dayStart(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime() / 1000; }
 function dayValue(t) { const d = new Date(t * 1000); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
@@ -652,8 +678,11 @@ async function tlLoadDay() {
   catch (e) { tl.cover = []; $("#tlnote").textContent = e.message; }
   tl.dayEvents = (await getJSON(`/api/timeline/events?from=${tl.day}&to=${t1}`).catch(() => ({ events: [] }))).events;
   tl.near = null;
-  if (!tl.cover.length) $("#tlnote").textContent = "No recordings on this day.";
-  else if (!tl.playing) $("#tlnote").textContent = "";
+  // Park the playhead at the day's first recording, so the zoomed bar and transcript show something.
+  if (!tl.playing && (tl.t == null || tl.t < tl.day || tl.t >= t1) && tl.cover.length) tl.t = tl.cover[0].start;
+  const none = "No recordings on this day.";
+  if (!tl.cover.length) $("#tlnote").textContent = none;
+  else if ($("#tlnote").textContent === none) $("#tlnote").textContent = "";
   tlDraw();
 }
 function tlNow() {
@@ -692,6 +721,14 @@ function drawBar(c, t0, len, tickEvery, majorEvery, events) {
     }
   }
   g.globalAlpha = 1;
+  const { a: sa, b: sb } = tl.sel;
+  if (sa != null) {
+    const x1 = (sa - t0) / len * w, x2 = sb != null ? (sb - t0) / len * w : x1;
+    g.fillStyle = css("--shade"); g.fillRect(x1, 0, Math.max(0, x2 - x1), h);
+    g.fillStyle = css("--accent");
+    g.fillRect(x1 - dpr, 0, 2 * dpr, h);
+    if (sb != null) g.fillRect(x2 - dpr, 0, 2 * dpr, h);
+  }
   const t = tlNow();
   if (t != null && t >= t0 && t < t0 + len) {
     g.fillStyle = css("--text");
@@ -769,7 +806,8 @@ function tlStopAudio() {
   for (const q of tl.queue) { try { q.src.stop(); } catch {} }
   tl.queue = []; tl.fetching = false;
 }
-function tlPlay(t) {
+function tlPlay(t, stopAt = null) {
+  tl.stopAt = stopAt;
   stop();  // the clip player
   tl.t = t; tlStopAudio();
   ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
@@ -821,6 +859,7 @@ function tlTick() {
     if (cur.epoch >= tl.day + dayLength(tl.day)) { tl.day = dayStart(cur.epoch * 1000); tlLoadDay(); }
   }
   if (tl.ended && ctx.currentTime > tl.ahead) { tlPause(); return; }
+  if (tl.stopAt != null && t >= tl.stopAt) { tlPause(); tl.t = tl.stopAt; tl.stopAt = null; tlDraw(); return; }
   tlDraw(); tlPump();
   requestAnimationFrame(tlTick);
 }
@@ -871,6 +910,66 @@ function tlClipJump(dir) {
   if (pick) tlSeekPlay(pick.at); else $("#tlnote").textContent = dir > 0 ? "No later clip on this day." : "No earlier clip on this day.";
 }
 $("#tlprevclip").onclick = () => tlClipJump(-1); $("#tlnextclip").onclick = () => tlClipJump(1);
+
+// --- selection: download it, or keep it as a clip ------------------------------------
+const fmtMs = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit",
+                                                                fractionalSecondDigits: 3 });
+function updateSel() {
+  const { a, b } = tl.sel, ok = a != null && b != null;
+  $("#selA").textContent = a != null ? fmtMs(a) : "–";
+  $("#selB").textContent = b != null ? fmtMs(b) : "–";
+  $("#seldur").textContent = ok ? `${(b - a).toFixed(2)} s` : a != null ? "now set the end" : "";
+  $("#selplay").disabled = $("#selclip").disabled = !ok;
+  $("#seldl").textContent = ok ? "Download selection" : "Download next minute";
+  document.querySelectorAll("[data-nudge]").forEach(btn => btn.disabled = tl.sel[btn.dataset.nudge[0]] == null);
+  if (tl.day != null) tlDraw();
+}
+const playhead = () => tlNow() ?? tl.t;
+$("#selstart").onclick = () => { const t = playhead(); if (t == null) return; tl.sel.a = t; if (tl.sel.b != null && tl.sel.b <= t) tl.sel.b = null; updateSel(); };
+$("#selend").onclick = () => {
+  const t = playhead(); if (t == null) return;
+  if (tl.sel.a == null || tl.sel.a >= t) { $("#tlnote").textContent = "Set the start first, before the end."; return; }
+  tl.sel.b = t; updateSel();
+};
+$("#selmoment").onclick = () => {
+  const t = playhead(), e = t == null ? null : eventAt(t, tl.near ? tl.near.events : tl.dayEvents);
+  if (!e) { $("#tlnote").textContent = "No detected moment under the playhead."; return; }
+  tl.sel = { a: e.at, b: e.at + e.dur }; updateSel();
+};
+$("#selclear").onclick = () => { tl.sel = { a: null, b: null }; updateSel(); };
+document.querySelectorAll("[data-nudge]").forEach(btn => btn.onclick = e => {
+  const [end, dir] = btn.dataset.nudge.split(","), step = (e.shiftKey ? 0.5 : 0.05) * +dir, sel = tl.sel;
+  if (sel[end] == null) return;
+  const v = sel[end] + step;
+  if ((end === "a" && sel.b != null && v >= sel.b) || (end === "b" && v <= sel.a)) return;
+  sel[end] = v; updateSel();
+});
+$("#selplay").onclick = () => tlPlay(tl.sel.a, tl.sel.b);
+$("#seldl").onclick = async () => {
+  let { a, b } = tl.sel;
+  if (a == null || b == null) { a = playhead(); if (a == null) { $("#tlnote").textContent = "Pick a time first."; return; } b = a + 60; }
+  const fmt = $("#dlfmt").value;
+  $("#tlnote").textContent = "Preparing download…";
+  try {
+    const r = await api(`/api/timeline/cut?` + new URLSearchParams({ from: a, to: b, format: fmt, download: 1 }));
+    const name = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || "bug-yourself.wav";
+    const url = URL.createObjectURL(await r.blob()), link = document.createElement("a");
+    link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    $("#tlnote").textContent = `Downloaded ${name}.`;
+  } catch (e) { $("#tlnote").textContent = "Can't download: " + e.message; }
+};
+$("#selclip").onclick = async () => {
+  const { a, b } = tl.sel; if (a == null || b == null) return;
+  const label = prompt("Name for the clip (optional):", "");
+  if (label === null) return;
+  try {
+    const c = await post("/api/timeline/clip", { from: a, to: b, label });
+    $("#tlnote").textContent = `Saved clip #${c.id} as ${c.name}; it's in Staged.`;
+    tl.near = null; tlLoadDay();
+  } catch (e) { $("#tlnote").textContent = "Can't make the clip: " + e.message; }
+};
+updateSel();
 $("#tlplay").onclick = () => tl.playing ? tlPause() : tlPlay(tl.t ?? (tl.cover && tl.cover[0] ? tl.cover[0].start : tl.day));
 $("#tlback10").onclick = () => tlStep(-10); $("#tlfwd10").onclick = () => tlStep(10);
 $("#tlback60").onclick = () => tlStep(-60); $("#tlfwd60").onclick = () => tlStep(60);
@@ -883,6 +982,9 @@ function tlKey(e, k) {
   if (k === " ") { e.preventDefault(); $("#tlplay").click(); }
   else if (k === "arrowright") { e.preventDefault(); tlStep(e.shiftKey ? 60 : 10); }
   else if (k === "arrowleft") { e.preventDefault(); tlStep(e.shiftKey ? -60 : -10); }
+  else if (k === "[") $("#selstart").click();
+  else if (k === "]") $("#selend").click();
+  else if (k === "escape") $("#selclear").click();
   else if (k === "n") tlClipJump(1);
   else if (k === "p") tlClipJump(-1);
 }
