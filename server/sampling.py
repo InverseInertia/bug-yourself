@@ -22,6 +22,17 @@ FADE_IN_S = 0.003
 FADE_OUT_S = 0.015
 
 
+def new_event_id(db):
+    """A number no event has ever had. SQLite would reuse the numbers of deleted rows
+    (re-detection deletes candidates), which would attach old ratings to new moments
+    and could give two clips the same file name."""
+    last = max(db.execute("SELECT coalesce((SELECT value FROM meta WHERE key='last_event_id'), 0)").fetchone()[0],
+               db.execute("SELECT coalesce(max(id), 0) FROM events").fetchone()[0])
+    db.execute("INSERT INTO meta(key, value) VALUES ('last_event_id', ?) "
+               "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (last + 1,))
+    return last + 1
+
+
 def run_epoch(run):
     """A run (a stretch of continuous chunks) is named after its first chunk's start."""
     return chunk_epoch(run + ".ogg")
@@ -87,9 +98,9 @@ def detect_chunk(db, locate, name, path):
         s = int(start - len(ctx) + ev.start)
         e = int(start - len(ctx) + ev.end)
         db.execute(
-            "INSERT INTO events(session, chunk, start_sample, end_sample, sr, at_time, kind, score, label, "
-            "features, status, detect_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run, name, s, e, int(sr), r_epoch + s / sr, ev.kind, float(ev.score), ev.label,
+            "INSERT INTO events(id, session, chunk, start_sample, end_sample, sr, at_time, kind, score, label, "
+            "features, status, detect_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (new_event_id(db), run, name, s, e, int(sr), r_epoch + s / sr, ev.kind, float(ev.score), ev.label,
              json.dumps(ev.features), "candidate", detect.VERSION, now))
     # New candidates have no tags yet: mark the chunk for the tagging step.
     db.execute("UPDATE chunks SET session=?, seq=?, start_sample=?, frames=?, sr=?, detect_version=?, ai_version=NULL "
@@ -156,6 +167,12 @@ def cut_event(db, locate, event_id, out_dir, pad_s=0.0, suffix=""):
     pad = int(pad_s * sr)
     x, sr = read_session_range(db, locate, session, max(0, a - pad), b + pad)
     dest = Path(out_dir) / clip_name(event_id, kind, label, at_time, suffix)
+    # Never reuse a clip name, wherever that clip is now (library, or moved out by you).
+    n = 2
+    while dest.exists() or db.execute("SELECT 1 FROM clips WHERE path LIKE ? ESCAPE '\\'",
+                                      ("%/" + dest.name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"),)).fetchone():
+        dest = Path(out_dir) / clip_name(event_id, kind, label, at_time, f"{suffix}_{n}")
+        n += 1
     write_flac(fade(x, sr), sr, dest)
     return dest
 

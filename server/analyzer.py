@@ -157,6 +157,10 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 CREATE INDEX IF NOT EXISTS embeddings_by_chunk ON embeddings(chunk);
 CREATE INDEX IF NOT EXISTS embeddings_by_event ON embeddings(ref_event);
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT PRIMARY KEY,           -- e.g. last_event_id: event numbers are never reused
+    value  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ratings (
     event_id  INTEGER PRIMARY KEY,      -- your verdict on a detected moment, for tuning
     rating    INTEGER NOT NULL,         -- 1 = good, -1 = bad
@@ -486,12 +490,31 @@ class Run:
     # samples -----------------------------------------------------------------
 
     def reconcile_clips(self):
-        """Clips you moved out or deleted by hand are expected, not errors."""
-        gone = [(cid,) for cid, path in self.db.execute(
-            "SELECT id, path FROM clips WHERE state IN ('new','library')") if not Path(path).exists()]
-        if gone and not self.dry:
+        """Clips you moved out or deleted by hand are expected, not errors. A staged clip
+        whose file is already in the library was moved by a run that stopped before
+        recording it: point the record at the library instead of calling it removed."""
+        gone, found = [], []
+        for cid, path, state in self.db.execute("SELECT id, path, state FROM clips WHERE state IN ('new','library')"):
+            p = Path(path)
+            if p.exists():
+                continue
+            if state == "new":
+                try:
+                    moved = self.cfg.samples_dir / p.relative_to(self.cfg.samples_new_dir)
+                except ValueError:
+                    moved = None
+                if moved is not None and moved.exists():
+                    found.append((cid, str(moved)))
+                    continue
+            gone.append((cid,))
+        if not self.dry:
+            for cid, moved in found:
+                self.db.execute("DELETE FROM clips WHERE path=? AND id != ?", (moved, cid))
+                self.db.execute("UPDATE clips SET path=?, state='library' WHERE id=?", (moved, cid))
             self.db.executemany("UPDATE clips SET state='clip_removed' WHERE id=?", gone)
             self.db.commit()
+        if found:
+            self.say(f"samples: {len(found)} clip(s) found in the library after an interrupted run; records fixed")
         if gone:
             self.say(f"samples: {len(gone)} clip(s) removed by you since last run")
 
@@ -510,9 +533,18 @@ class Run:
                 except (OSError, Conflict) as e:
                     log(f"moving clip {src.name} failed, will retry next run: {e}")
                     continue
-                cur = self.db.execute("UPDATE clips SET path=?, state='library' WHERE path=?", (str(dst), str(src)))
-                if cur.rowcount == 0:  # a file the analyzer didn't make: track it anyway
-                    self.db.execute("INSERT OR IGNORE INTO clips(path, cut_at, state) VALUES (?,?,?)",
+                staged = self.db.execute("SELECT id FROM clips WHERE path=?", (str(src),)).fetchone()
+                old = self.db.execute("SELECT id FROM clips WHERE path=?", (str(dst),)).fetchone()
+                if staged:
+                    if old:
+                        # An older record already claims this library path (e.g. a clip of the
+                        # same name you've since moved out). The file there now is this one.
+                        self.db.execute("DELETE FROM clips WHERE id=?", (old[0],))
+                    self.db.execute("UPDATE clips SET path=?, state='library' WHERE id=?", (str(dst), staged[0]))
+                elif old:
+                    self.db.execute("UPDATE clips SET state='library' WHERE id=?", (old[0],))
+                else:  # a file the analyzer didn't make: track it anyway
+                    self.db.execute("INSERT INTO clips(path, cut_at, state) VALUES (?,?,?)",
                                     (str(dst), dst.stat().st_mtime, "library"))
             moved += 1
         if not self.dry:

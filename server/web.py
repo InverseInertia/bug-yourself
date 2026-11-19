@@ -462,16 +462,22 @@ def timeline_make_clip(app, t0, t1, label):
     s = chunk_start + (a - off)
     e = s + (b - a)
     at = chunk_epoch(run + ".ogg") + s / sr
-    with app.db() as db:
-        cur = db.execute(
-            "INSERT INTO events(session, chunk, start_sample, end_sample, sr, at_time, kind, score, label, features, "
-            "status, detect_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run, name, s, e, sr, at, "manual", 1.0, slug(label), json.dumps({"made_in": "timeline"}),
-             "proposed", 0, time.time()))
-        ev_id = cur.lastrowid
-        dest = app.sampling.cut_event(db, app.locate, ev_id, app.cfg.samples_new_dir / "manual")
-        db.execute("INSERT INTO clips(path, cut_at, state, event_id) VALUES (?,?,?,?)",
-                   (str(dest), time.time(), "new", ev_id))
+    dest = None
+    try:
+        with app.db() as db:
+            ev_id = app.sampling.new_event_id(db)
+            db.execute(
+                "INSERT INTO events(id, session, chunk, start_sample, end_sample, sr, at_time, kind, score, label, "
+                "features, status, detect_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ev_id, run, name, s, e, sr, at, "manual", 1.0, slug(label), json.dumps({"made_in": "timeline"}),
+                 "proposed", 0, time.time()))
+            dest = app.sampling.cut_event(db, app.locate, ev_id, app.cfg.samples_new_dir / "manual")
+            db.execute("INSERT INTO clips(path, cut_at, state, event_id) VALUES (?,?,?,?)",
+                       (str(dest), time.time(), "new", ev_id))
+    except Exception:
+        if dest is not None:  # don't leave a file behind that no record knows about
+            dest.unlink(missing_ok=True)
+        raise
     return {"id": ev_id, "name": dest.name, "at": at, "dur": (e - s) / sr}
 
 
